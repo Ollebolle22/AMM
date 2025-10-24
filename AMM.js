@@ -555,10 +555,23 @@
     bodyBackgroundColor: '#fff', quantityBackgroundColor: '#1f1f1f'
   });
   const lines = [ makeLine('Grid Center', S.center, S.paused ? '#999' : '#78a6ff') ];
+  const buyColorActive = '#00ff94';
+  const sellColorActive = '#ff5a5a';
+  const buyColorNormal = '#53cf77';
+  const sellColorNormal = '#cf5353';
+  const buyColorPaused = '#295c3a';
+  const sellColorPaused = '#6b2d2d';
   for (let i = 0; i < Math.min(8, levels); i++) {
     const step = (price > 0 ? price : 1) * S.gridStepPct;
-    lines.push(makeLine(`Bid L${i+1}`, S.center - (i+1) * step, S.paused ? '#295c3a' : '#53cf77'));
-    lines.push(makeLine(`Ask L${i+1}`, S.center + (i+1) * step, S.paused ? '#6b2d2d' : '#cf5353'));
+    const isNext = i === 0;
+    const bidColor = S.paused
+      ? buyColorPaused
+      : (isNext ? buyColorActive : buyColorNormal);
+    const askColor = S.paused
+      ? sellColorPaused
+      : (isNext ? sellColorActive : sellColorNormal);
+    lines.push(makeLine(`Bid L${i+1}`, S.center - (i+1) * step, bidColor));
+    lines.push(makeLine(`Ask L${i+1}`, S.center + (i+1) * step, askColor));
   }
   gb.data.pairLedger.customChartTargets = lines;
 
