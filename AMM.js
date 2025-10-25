@@ -27,11 +27,16 @@
   if (typeof S.skewK !== 'number') S.skewK = 0.8;               // styrka för inventory-skew
   if (typeof S.recenterEveryMs !== 'number') S.recenterEveryMs = 60_000;
   if (typeof S.cancelTolerancePct !== 'number') S.cancelTolerancePct = 0.20 / 100; // 0.20%
+  if (typeof S.replaceTriggerPct !== 'number') {
+    const defaultTrigger = Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
+    S.replaceTriggerPct = defaultTrigger;            // min. prisförflyttning (% av pris) innan vi ersätter order
+  }
   if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;
   if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = 50;
   if (typeof S.minBaseAmt !== 'number') S.minBaseAmt = 1e-9;
   if (typeof S.usePostOnly !== 'boolean') S.usePostOnly = false;
   if (typeof S.trimInsidePct !== 'number') S.trimInsidePct = 0.25; // liten trim nära center
+  if (typeof S.localOrderTimeoutMs !== 'number') S.localOrderTimeoutMs = 15_000;
 
   // Valfria steg för avrundning (fyll rätt steg för paret vid behov)
   if (typeof S.qtyStep !== 'number') S.qtyStep = 0;    // t.ex. 0.1 DOGE, 0 = ingen avrundning
@@ -50,6 +55,8 @@
   if (typeof S.apiBackoffUntil !== 'number') S.apiBackoffUntil = 0; // epoch ms
   if (typeof S.apiBackoffMs !== 'number') S.apiBackoffMs = 0;       // senaste backoffvärde
   if (typeof S.apiBackoffMax !== 'number') S.apiBackoffMax = 120_000; // max 2m backoff
+  if (typeof S.apiFailCount !== 'number') S.apiFailCount = 0;
+  if (typeof S.lastApiError !== 'string') S.lastApiError = '';
 
   // Manuell center-reset flag
   if (typeof S.resetCenter !== 'boolean') S.resetCenter = false;
@@ -102,6 +109,61 @@
   const marginUsed = () => Math.abs(qty) * (price > 0 ? price : 1) / Math.max(1, S.leverage);
   const freeMargin = () => Math.max(0, equity() - marginUsed());
 
+  const safePromise = (fn) => {
+    try { return Promise.resolve(fn()); }
+    catch (err) { return Promise.reject(err); }
+  };
+
+  const callWithTimeout = async (promise, ms, label) => {
+    let timer;
+    const timeoutErr = new Error(`local-timeout ${label} after ${ms}ms`);
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutErr), Math.max(1, ms)); });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  const markApiFailure = (reason) => {
+    const nowTs = Date.now();
+    const reasonTxtRaw = reason && reason.message ? reason.message : String(reason || 'unknown');
+    const reasonTxt = reasonTxtRaw.length > 160 ? reasonTxtRaw.slice(0, 157) + '…' : reasonTxtRaw;
+    const alreadyBackoff = S.apiBackoffUntil > nowTs;
+    const next = S.apiBackoffMs > 0 ? Math.min(S.apiBackoffMs * 2, S.apiBackoffMax) : 15_000;
+    S.apiBackoffMs = next;
+    S.apiBackoffUntil = nowTs + next;
+    S.apiFailCount = (S.apiFailCount || 0) + 1;
+    const reasonChanged = S.lastApiError !== reasonTxt;
+    S.lastApiError = reasonTxt;
+    if (!alreadyBackoff || reasonChanged) {
+      gb.data.pairLedger.notifications = [
+        { text: `API issue (${reasonTxt}). Backing off ${Math.round(next/1000)}s`, variant: 'error', persist: false }
+      ];
+    }
+  };
+
+  const shouldBackoff = (err) => {
+    if (!err) return false;
+    const txt = (err.message ? err.message : String(err || '')).toLowerCase();
+    if (!txt) return false;
+    return txt.includes('timeout') || txt.includes('timed out') || txt.includes('etimedout') || txt.includes('econn') || txt.includes('connect') || txt.includes('network');
+  };
+
+  const clearApiFailure = () => {
+    if (S.apiBackoffMs !== 0 || S.apiFailCount !== 0 || (S.lastApiError && S.lastApiError.length)) {
+      S.apiFailCount = 0;
+      S.apiBackoffMs = 0;
+      S.apiBackoffUntil = 0;
+      if (S.lastApiError && S.lastApiError.length) {
+        gb.data.pairLedger.notifications = [
+          { text: 'API recovered. Resuming.', variant: 'success', persist: false }
+        ];
+      }
+      S.lastApiError = '';
+    }
+  };
+
   // Initiera metrics första gången vi har giltig data
   if (price > 0 && equity() > 0 && S.startTs === 0) {
     S.startTs = now;
@@ -134,7 +196,7 @@
       const eq = equity();
       const fm = freeMargin();
       const minFM = Math.max(0, S.minFreeMarginPct * Math.max(1e-9, eq));
-      if (fm <= minFM) pauseReason = 'Low free margin';
+      if (fm < minFM) pauseReason = 'Low free margin';
     }
   }
 
@@ -192,7 +254,14 @@
 
   // ==== Throttle / Open Orders Failsafe ====
   const cycleDue = now - S.lastCycleTs > S.cooldownMs;
-  const tol = S.cancelTolerancePct * (price > 0 ? price : 1);
+  const pxUnit = (price > 0 ? price : 1);
+  const tol = S.cancelTolerancePct * pxUnit;
+  const replaceTriggerPct = (Number.isFinite(S.replaceTriggerPct) && S.replaceTriggerPct > 0)
+    ? S.replaceTriggerPct
+    : Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
+  const replaceTriggerAbs = replaceTriggerPct * pxUnit;
+  const cancelTriggerAbs = Math.max(replaceTriggerAbs * 1.75, pxUnit * S.gridStepPct);
+  const matchTolerance = Math.max(tol, replaceTriggerAbs * 0.5);
 
   // === Open Orders Failsafe (NY) ===
   let oo = [];
@@ -211,6 +280,8 @@
     if (S.openOrdersFailSince > 0) apiUnstable = true;
     if (S.apiBackoffUntil > now) apiUnstable = true;
   }
+
+  const backoffLeftSec = S.apiBackoffUntil > now ? Math.ceil((S.apiBackoffUntil - now) / 1000) : 0;
 
   if (S.failsafeEnabled && S.openOrdersFailSince > 0 && (now - S.openOrdersFailSince > 3 * S.cooldownMs)) {
     if (!pauseReason) pauseReason = 'openOrders missing or delayed';
@@ -241,26 +312,168 @@
 
   // ==== Orderunderhåll + läggning ====
   if (cycleDue && !S.paused && !apiUnstable) {
-    // Cancel ordrar som avviker för mycket från grid
-    for (const o of oo) {
-      const id = o.id; const side = o.type; const rate = Number.isFinite(o.rate) ? o.rate : 0;
-      let keep = false;
-      if (side === 'buy') { for (let i = 0; i < bids.length; i++) if (Math.abs(rate - bids[i]) <= tol) { keep = true; break; } }
-      else if (side === 'sell') { for (let i = 0; i < asks.length; i++) if (Math.abs(rate - asks[i]) <= tol) { keep = true; break; } }
-      if (!keep) { try { gb.method.cancelOrder(id, pair, ex); } catch (e) { /* noop */ } }
+    const desired = [];
+    const pushDesired = (side, px, amt, tag) => {
+      if (!Number.isFinite(px) || px <= 0) return;
+      if (!Number.isFinite(amt) || amt <= 0) return;
+      desired.push({ side, px, amt, matched: false, tag });
+    };
+    if (S.role === 'long') {
+      for (let i = 0; i < bids.length; i++) pushDesired('buy', bids[i], sizeBaseB[i], `bid-${i}`);
+      const trims = Math.min(2, asks.length);
+      for (let i = 0; i < trims; i++) pushDesired('sell', asks[i], sizeBaseA[i] * S.trimInsidePct, `trimAsk-${i}`);
+    } else {
+      for (let i = 0; i < asks.length; i++) pushDesired('sell', asks[i], sizeBaseA[i], `ask-${i}`);
+      const trims = Math.min(2, bids.length);
+      for (let i = 0; i < trims; i++) pushDesired('buy', bids[i], sizeBaseB[i] * S.trimInsidePct, `trimBid-${i}`);
     }
 
-    // Önskade order per roll
-    const want = [];
-    if (S.role === 'long') {
-      for (let i = 0; i < bids.length; i++) want.push({ side: 'buy', px: bids[i], amt: sizeBaseB[i] });
-      const trims = Math.min(2, asks.length);
-      for (let i = 0; i < trims; i++) want.push({ side: 'sell', px: asks[i], amt: sizeBaseA[i] * S.trimInsidePct });
-    } else {
-      for (let i = 0; i < asks.length; i++) want.push({ side: 'sell', px: asks[i], amt: sizeBaseA[i] });
-      const trims = Math.min(2, bids.length);
-      for (let i = 0; i < trims; i++) want.push({ side: 'buy', px: bids[i], amt: sizeBaseB[i] * S.trimInsidePct });
+    const rateFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return 0;
+      const fields = ['rate', 'price', 'limit_price', 'orderPrice', 'avgPrice', 'avg_price', 'priceAvg'];
+      for (const f of fields) {
+        if (!(f in o)) continue;
+        const raw = o[f];
+        const num = typeof raw === 'number' ? raw : Number(raw);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return 0;
+    };
+
+    const sideFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return '';
+      const raw = o.type || o.side || o.orderSide || o.positionSide;
+      if (!raw) return '';
+      const txt = String(raw).toLowerCase();
+      if (txt.startsWith('buy') || txt === 'long' || txt === '1') return 'buy';
+      if (txt.startsWith('sell') || txt === 'short' || txt === '2') return 'sell';
+      return '';
+    };
+
+    const idFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return '';
+      const fields = ['id', 'orderId', 'order_id', 'clientOrderId', 'client_order_id', 'clOrdID'];
+      for (const f of fields) {
+        const val = o[f];
+        if (val !== undefined && val !== null && String(val).length) return String(val);
+      }
+      return '';
+    };
+
+    const replaceMethodName = (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder'
+      : (gb.method && typeof gb.method.amendOrder === 'function') ? 'amendOrder'
+      : (gb.method && typeof gb.method.editOrder === 'function') ? 'editOrder'
+      : '';
+    const canReplace = Boolean(replaceMethodName);
+
+    const qtyFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return 0;
+      const fields = ['quantity', 'qty', 'amount', 'origQty', 'baseQuantity', 'size'];
+      for (const f of fields) {
+        if (!(f in o)) continue;
+        const v = o[f];
+        const num = typeof v === 'number' ? v : Number(v);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return 0;
+    };
+
+    const findWithinTolerance = (side, rate) => {
+      if (!Number.isFinite(rate) || rate <= 0) return null;
+      for (const d of desired) {
+        if (d.matched) continue;
+        if (d.side !== side) continue;
+        if (Math.abs(rate - d.px) <= matchTolerance) return d;
+      }
+      return null;
+    };
+
+    const findClosestTarget = (side, rate) => {
+      if (!Number.isFinite(rate) || rate <= 0) return null;
+      let best = null; let bestDist = Infinity;
+      for (const d of desired) {
+        if (d.matched) continue;
+        if (d.side !== side) continue;
+        const dist = Math.abs(rate - d.px);
+        if (dist < bestDist) { bestDist = dist; best = d; }
+      }
+      return best;
+    };
+
+    const replaceOne = async (order, target) => {
+      if (!canReplace || !order || !target) return false;
+      const id = idFromOrder(order);
+      if (!id) return false;
+      const qtyExisting = qtyFromOrder(order);
+      const qty = Number.isFinite(target.amt) && target.amt > 0 ? target.amt : qtyExisting;
+      if (!Number.isFinite(qty) || qty <= 0) return false;
+      try {
+        const method = gb.method[replaceMethodName];
+        await callWithTimeout(safePromise(() => method(id, qty, target.px, pair, ex)), S.localOrderTimeoutMs, 'replace order');
+        clearApiFailure();
+        target.matched = true;
+        console.log('[GRID]', S.role, 'replaced', sideFromOrder(order), qty, '@', target.px);
+        return true;
+      } catch (err) {
+        console.log('[GRID] replace err', sideFromOrder(order), target.px, err && err.message ? err.message : err);
+        if (shouldBackoff(err)) markApiFailure(err);
+        return false;
+      }
+    };
+
+    const cancelOne = async (order) => {
+      if (!order) return false;
+      const id = typeof order === 'string' ? order : idFromOrder(order);
+      if (!id) return false;
+      try {
+        await callWithTimeout(safePromise(() => gb.method.cancelOrder(id, pair, ex)), S.localOrderTimeoutMs, 'cancel order');
+        clearApiFailure();
+        return true;
+      } catch (err) {
+        console.log('[GRID] cancel err', id, err && err.message ? err.message : err);
+        if (shouldBackoff(err)) markApiFailure(err);
+        return false;
+      }
+    };
+
+    const observedBook = [];
+
+    for (const o of oo) {
+      if (S.apiBackoffUntil > Date.now()) break;
+      const side = sideFromOrder(o);
+      const rate = rateFromOrder(o);
+      if (!rate || (side !== 'buy' && side !== 'sell')) continue;
+      observedBook.push({ side, px: rate });
+      const exact = findWithinTolerance(side, rate);
+      if (exact) {
+        exact.matched = true;
+        continue;
+      }
+      const target = findClosestTarget(side, rate);
+      let handled = false;
+      if (target) {
+        const dist = Math.abs(rate - target.px);
+        if (dist <= replaceTriggerAbs) {
+          target.matched = true;
+          continue;
+        }
+        handled = await replaceOne(o, target);
+        if (!handled) {
+          if (S.apiBackoffUntil > Date.now()) break;
+          if (dist < cancelTriggerAbs) {
+            target.matched = true;
+            continue;
+          }
+        }
+      }
+      if (!handled) {
+        if (S.apiBackoffUntil > Date.now()) break;
+        await cancelOne(o);
+        if (S.apiBackoffUntil > Date.now()) break;
+      }
     }
+
+    S.observedOrderBook = observedBook;
 
     // Dubblettskydd (lokalt) under denna cykel
     if (!Array.isArray(S.recentPlaced)) S.recentPlaced = [];
@@ -282,42 +495,62 @@
           }
         }
 
-        if (S.usePostOnly) {
-          if (side === 'buy') await gb.method.buyLimitPostOnly(amt, px, pair, ex);
-          else await gb.method.sellLimitPostOnly(amt, px, pair, ex);
-        } else {
-          if (side === 'buy') await gb.method.buyLimit(amt, px, pair, ex);
-          else await gb.method.sellLimit(amt, px, pair, ex);
-        }
+        const exec = () => {
+          if (S.usePostOnly) {
+            if (side === 'buy') return gb.method.buyLimitPostOnly(amt, px, pair, ex);
+            return gb.method.sellLimitPostOnly(amt, px, pair, ex);
+          }
+          if (side === 'buy') return gb.method.buyLimit(amt, px, pair, ex);
+          return gb.method.sellLimit(amt, px, pair, ex);
+        };
+
+        await callWithTimeout(safePromise(exec), S.localOrderTimeoutMs, 'place order');
+        clearApiFailure();
         S.recentPlaced.push({ side, px, ts: Date.now() });
+        observedBook.push({ side, px });
         console.log('[GRID]', S.role, 'placed', side, amt, '@', px);
         return true;
       } catch (e) {
         console.log('[GRID] place err', side, px, e && e.message ? e.message : e);
+        if (shouldBackoff(e)) markApiFailure(e);
         return false;
       }
     };
 
-    for (const w of want) {
-      if (openCount + added >= S.maxActiveOrders || added >= maxAdd) break;
+    const missing = desired.filter(d => !d.matched);
 
-      // Existerar redan på börsen inom tolerans?
-      let exists = false;
-      for (const o of oo) {
-        const sameSide = o.type === w.side; const rate = Number.isFinite(o.rate) ? o.rate : 0;
-        if (sameSide && Math.abs(rate - w.px) <= tol) { exists = true; break; }
+    if (S.apiBackoffUntil <= Date.now()) {
+      for (const w of missing) {
+        if (openCount + added >= S.maxActiveOrders || added >= maxAdd) break;
+
+        // Existerar redan på börsen inom tolerans?
+        let exists = false;
+        for (const o of oo) {
+          const sameSide = sideFromOrder(o) === w.side;
+          const rate = rateFromOrder(o);
+          if (sameSide && Math.abs(rate - w.px) <= tol) { exists = true; break; }
+        }
+        if (exists) continue;
+
+        // Finns i våra nyligen lagda (race-skydd)?
+        let recentDup = false;
+        for (const r of S.recentPlaced) {
+          if (r.side === w.side && Math.abs(r.px - w.px) <= tol) { recentDup = true; break; }
+        }
+        if (recentDup) continue;
+
+        if (Array.isArray(S.observedOrderBook)) {
+          let alreadySeen = false;
+          for (const ob of S.observedOrderBook) {
+            if (ob.side === w.side && Math.abs(ob.px - w.px) <= tol) { alreadySeen = true; break; }
+          }
+          if (alreadySeen) continue;
+        }
+
+        const ok = await placeOne(w.side, w.px, w.amt);
+        if (ok) added++;
+        else if (S.apiBackoffUntil > Date.now()) break;
       }
-      if (exists) continue;
-
-      // Finns i våra nyligen lagda (race-skydd)?
-      let recentDup = false;
-      for (const r of S.recentPlaced) {
-        if (r.side === w.side && Math.abs(r.px - w.px) <= tol) { recentDup = true; break; }
-      }
-      if (recentDup) continue;
-
-      const ok = await placeOne(w.side, w.px, w.amt);
-      if (ok) added++;
     }
 
     if (added > 0) {
@@ -398,19 +631,34 @@
 
   // ==== Visuals (frivilligt i GUI) ====
   const makeLine = (txt, px, color) => ({
-    text: txt, price: px, lineStyle: 2, lineWidth: 1, lineColor: color,
+    text: txt, price: px, lineStyle: 2, lineWidth: 0.6, lineColor: color,
     bodyBackgroundColor: '#fff', quantityBackgroundColor: '#1f1f1f'
   });
   const lines = [ makeLine('Grid Center', S.center, S.paused ? '#999' : '#78a6ff') ];
+  const buyColorActive = '#00ff94';
+  const sellColorActive = '#ff5a5a';
+  const buyColorNormal = '#53cf77';
+  const sellColorNormal = '#cf5353';
+  const buyColorPaused = '#295c3a';
+  const sellColorPaused = '#6b2d2d';
   for (let i = 0; i < Math.min(8, levels); i++) {
     const step = (price > 0 ? price : 1) * S.gridStepPct;
-    lines.push(makeLine(`Bid L${i+1}`, S.center - (i+1) * step, S.paused ? '#295c3a' : '#53cf77'));
-    lines.push(makeLine(`Ask L${i+1}`, S.center + (i+1) * step, S.paused ? '#6b2d2d' : '#cf5353'));
+    const isNext = i === 0;
+    const bidColor = S.paused
+      ? buyColorPaused
+      : (isNext ? buyColorActive : buyColorNormal);
+    const askColor = S.paused
+      ? sellColorPaused
+      : (isNext ? sellColorActive : sellColorNormal);
+    lines.push(makeLine(`Bid L${i+1}`, S.center - (i+1) * step, bidColor));
+    lines.push(makeLine(`Ask L${i+1}`, S.center + (i+1) * step, askColor));
   }
   gb.data.pairLedger.customChartTargets = lines;
 
   // ==== Sidopanel ====
-  const statusTxt = S.paused ? `PAUSED: ${S.lastPauseReason || 'unknown'}` : 'RUNNING';
+  const statusTxt = S.paused
+    ? `PAUSED: ${S.lastPauseReason || 'unknown'}`
+    : (backoffLeftSec > 0 ? `API BACKOFF (${backoffLeftSec}s)` : 'RUNNING');
   gb.data.pairLedger.sidebarExtras = [
     { label: 'Role', value: S.role.toUpperCase() },
     { label: 'Status', value: statusTxt, valueColor: S.paused ? '#ffb4a2' : '#b7f7c1' },
@@ -459,8 +707,14 @@
       value: S.apiBackoffUntil > now ? `${Math.ceil((S.apiBackoffUntil - now)/1000)}s` : '-',
       tooltip: 'Backoff-interval vid API-fel'
     },
+    {
+      label: 'API last err',
+      value: S.lastApiError && S.lastApiError.length ? (S.lastApiError.length > 36 ? S.lastApiError.slice(0, 33) + '…' : S.lastApiError) : '-',
+      tooltip: S.lastApiError && S.lastApiError.length ? S.lastApiError : 'Senaste API-felmeddelande'
+    },
+    { label: 'API fail count', value: String(S.apiFailCount || 0) },
   ];
 
   // ==== Log ====
-  console.log(`[GRID] role=${S.role} status=${S.paused?'PAUSED':'RUNNING'} reason=${S.lastPauseReason||'-'} p=${(price>0?price:0).toFixed(6)} center=${S.center.toFixed(6)} step%=${(S.gridStepPct*100).toFixed(3)} levels=${S.levelsPerSide}`);
+  console.log(`[GRID] role=${S.role} status=${statusTxt} reason=${S.lastPauseReason||'-'} backoff=${backoffLeftSec}s p=${(price>0?price:0).toFixed(6)} center=${S.center.toFixed(6)} step%=${(S.gridStepPct*100).toFixed(3)} levels=${S.levelsPerSide}`);
 })();
