@@ -26,7 +26,7 @@
 
   // ==== Defaults (ändra i runtime via customStratStore) ====
   if (typeof S.gridStepPct !== 'number') S.gridStepPct = 0.003;
-  if (typeof S.levelsPerSide !== 'number') S.levelsPerSide = 2;
+  if (typeof S.levelsPerSide !== 'number') S.levelsPerSide = 3;
   if (typeof S.allocPct !== 'number') S.allocPct = 0.05;          // 5% av fri marginal
   if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;
   if (typeof S.skewK !== 'number') S.skewK = 0.8;
@@ -36,15 +36,15 @@
     const defaultTrigger = Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
     S.replaceTriggerPct = defaultTrigger;
   }
-  if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;      // du har 6s exchange delay externt
-  if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = Math.max(4, 2 * (S.levelsPerSide || 2)); // tak per instans
+  if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;      // t.ex. 6s exchange delay externt
   if (typeof S.minBaseAmt !== 'number') S.minBaseAmt = 1e-9;
   if (typeof S.usePostOnly !== 'boolean') S.usePostOnly = false;
-  if (typeof S.trimInsidePct !== 'number') S.trimInsidePct = 0;   // inga trims nära center
+  if (typeof S.trimInsidePct !== 'number') S.trimInsidePct = 0.15; // trims nära center, 15% av normal storlek
+  if (typeof S.trimLevels !== 'number') S.trimLevels = 1;          // max 1 trim per sida
   if (typeof S.localOrderTimeoutMs !== 'number') S.localOrderTimeoutMs = 15_000;
 
   // Tick/lot defaults (justera per instrument vid behov)
-  if (typeof S.priceStep !== 'number') S.priceStep = 0.0001; // ex. DOGEUSDT
+  if (typeof S.priceStep !== 'number') S.priceStep = 0.0001; // ex. DOGEUSDT typiskt 0.0001
   if (typeof S.qtyStep !== 'number')   S.qtyStep   = 1;      // ex. 1 DOGE
 
   // Orderstorleksregler
@@ -225,6 +225,10 @@
 
   // ==== Bygg grid ====
   const levels = Math.max(1, Math.min(S.levelsPerSide, 25));
+
+  // Sätt default för maxActiveOrders ENDAST om den inte redan är satt
+  if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = 2 * S.levelsPerSide + S.trimLevels; // totalt ≈ huvudnivåer per sida
+
   const allocQuote = freeMargin() * Math.max(0, Math.min(1, S.allocPct));
   const weights = []; for (let i = 1; i <= levels; i++) weights.push(1 / i);
   const wSum = weights.reduce((a, b) => a + b, 0);
@@ -442,26 +446,38 @@
 
   // ==== Orderunderhåll + läggning ====
   if (cycleDue && !S.paused && !apiUnstable) {
+    // helper: minsta basmängd som motsvarar minOrderQuote
+    const minBaseByQuote = (qPx) => roundToStep(S.minOrderQuote / Math.max(1e-9, qPx), S.qtyStep);
+
     const desired = [];
     const pushDesired = (side, px, amt, tag) => {
       if (!Number.isFinite(px) || px <= 0) return;
       if (!Number.isFinite(amt) || amt <= 0) return;
+      // dedup per sida+pris inom matchTolerance
       for (const d of desired) {
         if (d.side === side && Math.abs(d.px - px) <= matchTolerance) return;
       }
       desired.push({ side, px, amt, matched: false, tag });
     };
+
+    // primära grid-ordrar + trims
     if (S.role === 'long') {
-      for (let i = 0; i < bids.length; i++) pushDesired('buy', bids[i], sizeBaseB[i], `bid-${i}`);
-      const trims = Math.min(0, asks.length);
-      for (let i = 0; i < trims; i++) pushDesired('sell', asks[i], sizeBaseA[i] * S.trimInsidePct, `trimAsk-${i}`);
+      for (let i = 0; i < bids.length; i++) pushDesired('buy',  bids[i], sizeBaseB[i], `bid-${i}`);
+      const trims = Math.min(S.trimLevels, asks.length);
+      for (let i = 0; i < trims; i++) {
+        const amt = Math.max(minBaseByQuote(price), roundToStep(sizeBaseA[i] * S.trimInsidePct, S.qtyStep));
+        pushDesired('sell', asks[i], amt, `trimAsk-${i}`);
+      }
     } else {
       for (let i = 0; i < asks.length; i++) pushDesired('sell', asks[i], sizeBaseA[i], `ask-${i}`);
-      const trims = Math.min(0, bids.length);
-      for (let i = 0; i < trims; i++) pushDesired('buy', bids[i], sizeBaseB[i] * S.trimInsidePct, `trimBid-${i}`);
+      const trims = Math.min(S.trimLevels, bids.length);
+      for (let i = 0; i < trims; i++) {
+        const amt = Math.max(minBaseByQuote(price), roundToStep(sizeBaseB[i] * S.trimInsidePct, S.qtyStep));
+        pushDesired('buy', bids[i], amt, `trimBid-${i}`);
+      }
     }
 
-    const desiredBuy = desired.filter(d => d.side === 'buy').length;
+    const desiredBuy  = desired.filter(d => d.side === 'buy').length;
     const desiredSell = desired.filter(d => d.side === 'sell').length;
 
     console.log('[GRID]', S.role, 'cykelstart',
@@ -472,6 +488,46 @@
       `säljmål=${desiredSell}`,
       `backoff=${backoffLeftSec}s`);
 
+    // === Hjälpare för orderfält ===
+    const rateFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return 0;
+      const fields = ['rate','price','limit_price','orderPrice','avgPrice','avg_price','priceAvg'];
+      for (const f of fields) {
+        if (!(f in o)) continue;
+        const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return 0;
+    };
+    const sideFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return '';
+      const raw = o.type || o.side || o.orderSide || o.positionSide;
+      if (!raw) return '';
+      const txt = String(raw).toLowerCase();
+      if (txt.startsWith('buy')  || txt === 'long'  || txt === '1') return 'buy';
+      if (txt.startsWith('sell') || txt === 'short' || txt === '2') return 'sell';
+      return '';
+    };
+    const idFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return '';
+      const fields = ['id','orderId','order_id','clientOrderId','client_order_id','clOrdID'];
+      for (const f of fields) {
+        const v = o[f];
+        if (v !== undefined && v !== null && String(v).length) return String(v);
+      }
+      return '';
+    };
+    const qtyFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return 0;
+      const fields = ['quantity','qty','amount','origQty','baseQuantity','size'];
+      for (const f of fields) {
+        if (!(f in o)) continue;
+        const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return 0;
+    };
+
     const findWithinTolerance = (side, rate) => {
       if (!Number.isFinite(rate) || rate <= 0) return null;
       for (const d of desired) {
@@ -481,7 +537,6 @@
       }
       return null;
     };
-
     const findClosestTarget = (side, rate) => {
       if (!Number.isFinite(rate) || rate <= 0) return null;
       let best = null; let bestDist = Infinity;
@@ -579,11 +634,12 @@
 
     // Lägg saknade upp till gränser
     const openCount = oo.length;
-    const perSideCap = Math.max(1, Math.min(3, S.levelsPerSide)); // högst 3/side/cykel
     const maxAdd     = Math.max(1, Math.min(4, S.maxActiveOrders)); // högst 4 totalt/cykel
+    let added = 0; const addedSide = { buy: 0, sell: 0 };
 
-    const placeOne = async (side, px, amt) => {
+    const placeOne = async (side, px, amt, tag) => {
       try {
+        // skydd mot nära dubbletter
         for (const r of S.recentPlaced) {
           if (r.side === side && Math.abs(r.px - px) <= matchTolerance) {
             console.log('[GRID] skipped place (recent duplicate)', side, amt, '@', px);
@@ -602,7 +658,7 @@
         clearApiFailure();
         S.recentPlaced.push({ side, px, ts: Date.now() });
         S.observedCache.push({ side, px, ts: Date.now() });
-        console.log('[GRID]', S.role, 'placed', side, amt, '@', px);
+        console.log('[GRID]', S.role, 'placed', tag || side, amt, '@', px);
         return true;
       } catch (e) {
         console.log('[GRID] place err', side, px, e && e.message ? e.message : e);
@@ -611,7 +667,7 @@
       }
     };
 
-    // Missing mål
+    // saknade mål
     let missing = desired.filter(d => !d.matched);
 
     // slå ihop mål inom matchTolerance så bara ett per sida+pris återstår
@@ -623,7 +679,7 @@
     missing = coalesce;
 
     if (missing.length) {
-      const missTxt = missing.map(m => `${m.side}@${m.px.toFixed ? m.px.toFixed(6) : Number(m.px).toFixed(6)}`).join(', ');
+      const missTxt = missing.map(m => `${m.side}@${m.px.toFixed ? m.px.toFixed(6) : Number(m.px).toFixed(6)}${m.tag?`(${m.tag})`:''}`).join(', ');
       console.log('[GRID]', S.role, 'saknar', missing.length, 'mål -> försöker lägga', missTxt);
     }
 
@@ -638,25 +694,34 @@
       if (desired.some(d => d.side === c.side && Math.abs(d.px - c.px) <= matchTolerance)) haveSide[c.side]++;
     }
 
-    let added = 0; const addedSide = { buy: 0, sell: 0 };
-
     if (S.apiBackoffUntil <= Date.now()) {
       for (const w of missing) {
-        if (openCount + added >= S.maxActiveOrders || added >= maxAdd) break;
-        if (addedSide[w.side] >= perSideCap) continue;
+        // per-cykelgräns
+        if (added >= maxAdd) break;
 
+        // per-sida: tillåt trims utöver levelsPerSide
+        const isTrim = w.tag && w.tag.startsWith('trim');
+        const sideCap = S.levelsPerSide + (isTrim ? S.trimLevels : 0);
+        if ((haveSide[w.side] + addedSide[w.side]) >= sideCap) continue;
+
+        // total cap
+        if ((openCount + added) >= S.maxActiveOrders) break;
+
+        // finns redan på börsen?
         let exists = false;
         for (const o of oo) {
           if (sideFromOrder(o) === w.side && Math.abs(rateFromOrder(o) - w.px) <= matchTolerance) { exists = true; break; }
         }
         if (exists) continue;
 
+        // nyligen lagd?
         let recentDup = false;
         for (const r of S.recentPlaced) {
           if (r.side === w.side && Math.abs(r.px - w.px) <= matchTolerance) { recentDup = true; break; }
         }
         if (recentDup) continue;
 
+        // redan observerad i cache nyligen?
         let cached = false;
         for (const c of S.observedCache) {
           if (c.side === w.side && Math.abs(c.px - w.px) <= matchTolerance) {
@@ -669,7 +734,7 @@
           continue;
         }
 
-        const ok = await placeOne(w.side, w.px, w.amt);
+        const ok = await placeOne(w.side, w.px, w.amt, w.tag);
         if (ok) { added++; addedSide[w.side]++; }
         else if (S.apiBackoffUntil > Date.now()) break;
       }
@@ -691,6 +756,7 @@
   } else if (cycleDue) {
     console.log('[GRID]', S.role, 'hoppar över cykel p.g.a.', S.paused ? `paus (${S.lastPauseReason||'-'})` : 'API-backoff');
   }
+
 
   // ==== Metrics & Sidebar ====
   const curEq = equity();
