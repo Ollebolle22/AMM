@@ -328,32 +328,67 @@
       for (let i = 0; i < trims; i++) pushDesired('buy', bids[i], sizeBaseB[i] * S.trimInsidePct, `trimBid-${i}`);
     }
 
-    const replaceMethodName = (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder'
-      : (gb.method && typeof gb.method.amendOrder === 'function') ? 'amendOrder'
-      : (gb.method && typeof gb.method.editOrder === 'function') ? 'editOrder'
-      : '';
+    // === Hjälpare för orderfält (robust mot olika börsformat) ===
+    const rateFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return 0;
+      const fields = ['rate', 'price', 'limit_price', 'orderPrice', 'avgPrice', 'avg_price', 'priceAvg'];
+      for (const f of fields) {
+        if (!(f in o)) continue;
+        const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return 0;
+    };
+
+    const sideFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return '';
+      const raw = o.type || o.side || o.orderSide || o.positionSide;
+      if (!raw) return '';
+      const txt = String(raw).toLowerCase();
+      if (txt.startsWith('buy') || txt === 'long' || txt === '1') return 'buy';
+      if (txt.startsWith('sell') || txt === 'short' || txt === '2') return 'sell';
+      return '';
+    };
+
+    const idFromOrder = (o) => {
+      if (!o || typeof o !== 'object') return '';
+      const fields = ['id', 'orderId', 'order_id', 'clientOrderId', 'client_order_id', 'clOrdID'];
+      for (const f of fields) {
+        const v = o[f];
+        if (v !== undefined && v !== null && String(v).length) return String(v);
+      }
+      return '';
+    };
+
+    const replaceMethodName =
+      (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder' :
+      (gb.method && typeof gb.method.amendOrder   === 'function') ? 'amendOrder'   :
+      (gb.method && typeof gb.method.editOrder    === 'function') ? 'editOrder'    : '';
     const canReplace = Boolean(replaceMethodName);
 
     const qtyFromOrder = (o) => {
       if (!o || typeof o !== 'object') return 0;
       const fields = ['quantity', 'qty', 'amount', 'origQty', 'baseQuantity', 'size'];
       for (const f of fields) {
-        const v = o[f];
-        if (Number.isFinite(v) && v > 0) return Number(v);
+        if (!(f in o)) continue;
+        const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
+        if (Number.isFinite(num) && num > 0) return num;
       }
       return 0;
     };
 
     const findWithinTolerance = (side, rate) => {
+      if (!Number.isFinite(rate) || rate <= 0) return null;
       for (const d of desired) {
         if (d.matched) continue;
         if (d.side !== side) continue;
-        if (Math.abs(rate - d.px) <= tol) return d;
+        if (Math.abs(rate - d.px) <= matchTolerance) return d;
       }
       return null;
     };
 
     const findClosestTarget = (side, rate) => {
+      if (!Number.isFinite(rate) || rate <= 0) return null;
       let best = null; let bestDist = Infinity;
       for (const d of desired) {
         if (d.matched) continue;
@@ -366,24 +401,27 @@
 
     const replaceOne = async (order, target) => {
       if (!canReplace || !order || !target) return false;
+      const id = idFromOrder(order);
+      if (!id) return false;
       const qtyExisting = qtyFromOrder(order);
-      const qty = Number.isFinite(target.amt) && target.amt > 0 ? target.amt : qtyExisting;
-      if (!Number.isFinite(qty) || qty <= 0) return false;
+      const q = Number.isFinite(target.amt) && target.amt > 0 ? target.amt : qtyExisting;
+      if (!Number.isFinite(q) || q <= 0) return false;
       try {
         const method = gb.method[replaceMethodName];
-        await callWithTimeout(safePromise(() => method(order.id, qty, target.px, pair, ex)), S.localOrderTimeoutMs, 'replace order');
+        await callWithTimeout(safePromise(() => method(id, q, target.px, pair, ex)), S.localOrderTimeoutMs, 'replace order');
         clearApiFailure();
         target.matched = true;
-        console.log('[GRID]', S.role, 'replaced', order.type, qty, '@', target.px);
+        console.log('[GRID]', S.role, 'replaced', sideFromOrder(order), q, '@', target.px);
         return true;
       } catch (err) {
-        console.log('[GRID] replace err', order.type, target.px, err && err.message ? err.message : err);
+        console.log('[GRID] replace err', sideFromOrder(order), target.px, err && err.message ? err.message : err);
         if (shouldBackoff(err)) markApiFailure(err);
         return false;
       }
     };
 
-    const cancelOne = async (id) => {
+    const cancelOne = async (orderOrId) => {
+      const id = typeof orderOrId === 'string' ? orderOrId : idFromOrder(orderOrId);
       if (!id) return false;
       try {
         await callWithTimeout(safePromise(() => gb.method.cancelOrder(id, pair, ex)), S.localOrderTimeoutMs, 'cancel order');
@@ -396,25 +434,44 @@
       }
     };
 
+    const observedBook = [];
+
+    // Genomgång av befintliga ordrar: matcha, ersätt eller avbryt
     for (const o of oo) {
       if (S.apiBackoffUntil > Date.now()) break;
-      const side = o.type;
-      const rate = Number.isFinite(o.rate) ? o.rate : 0;
+      const side = sideFromOrder(o);
+      const rate = rateFromOrder(o);
       if (!rate || (side !== 'buy' && side !== 'sell')) continue;
+      observedBook.push({ side, px: rate });
+
       const exact = findWithinTolerance(side, rate);
-      if (exact) {
-        exact.matched = true;
-        continue;
-      }
+      if (exact) { exact.matched = true; continue; }
+
       const target = findClosestTarget(side, rate);
       let handled = false;
-      if (target) handled = await replaceOne(o, target);
+      if (target) {
+        const dist = Math.abs(rate - target.px);
+        if (dist <= replaceTriggerAbs) { // nära nog, lämna den
+          target.matched = true;
+          continue;
+        }
+        handled = await replaceOne(o, target);
+        if (!handled) {
+          if (S.apiBackoffUntil > Date.now()) break;
+          if (dist < cancelTriggerAbs) { // för nära för att vara värt att cancella
+            target.matched = true;
+            continue;
+          }
+        }
+      }
       if (!handled) {
         if (S.apiBackoffUntil > Date.now()) break;
-        await cancelOne(o.id);
+        await cancelOne(o);
         if (S.apiBackoffUntil > Date.now()) break;
       }
     }
+
+    S.observedOrderBook = observedBook;
 
     // Dubblettskydd (lokalt) under denna cykel
     if (!Array.isArray(S.recentPlaced)) S.recentPlaced = [];
@@ -448,6 +505,7 @@
         await callWithTimeout(safePromise(exec), S.localOrderTimeoutMs, 'place order');
         clearApiFailure();
         S.recentPlaced.push({ side, px, ts: Date.now() });
+        observedBook.push({ side, px });
         console.log('[GRID]', S.role, 'placed', side, amt, '@', px);
         return true;
       } catch (e) {
@@ -466,7 +524,8 @@
         // Existerar redan på börsen inom tolerans?
         let exists = false;
         for (const o of oo) {
-          const sameSide = o.type === w.side; const rate = Number.isFinite(o.rate) ? o.rate : 0;
+          const sameSide = sideFromOrder(o) === w.side;
+          const rate = rateFromOrder(o);
           if (sameSide && Math.abs(rate - w.px) <= tol) { exists = true; break; }
         }
         if (exists) continue;
@@ -477,6 +536,15 @@
           if (r.side === w.side && Math.abs(r.px - w.px) <= tol) { recentDup = true; break; }
         }
         if (recentDup) continue;
+
+        // Redan observerad i denna cykel?
+        if (Array.isArray(S.observedOrderBook)) {
+          let alreadySeen = false;
+          for (const ob of S.observedOrderBook) {
+            if (ob.side === w.side && Math.abs(ob.px - w.px) <= tol) { alreadySeen = true; break; }
+          }
+          if (alreadySeen) continue;
+        }
 
         const ok = await placeOne(w.side, w.px, w.amt);
         if (ok) added++;
