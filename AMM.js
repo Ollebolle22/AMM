@@ -27,6 +27,10 @@
   if (typeof S.skewK !== 'number') S.skewK = 0.8;               // styrka för inventory-skew
   if (typeof S.recenterEveryMs !== 'number') S.recenterEveryMs = 60_000;
   if (typeof S.cancelTolerancePct !== 'number') S.cancelTolerancePct = 0.20 / 100; // 0.20%
+  if (typeof S.replaceTriggerPct !== 'number') {
+    const defaultTrigger = Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
+    S.replaceTriggerPct = defaultTrigger;            // min. prisförflyttning (% av pris) innan vi ersätter order
+  }
   if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;
   if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = 50;
   if (typeof S.minBaseAmt !== 'number') S.minBaseAmt = 1e-9;
@@ -192,7 +196,7 @@
       const eq = equity();
       const fm = freeMargin();
       const minFM = Math.max(0, S.minFreeMarginPct * Math.max(1e-9, eq));
-      if (fm <= minFM) pauseReason = 'Low free margin';
+      if (fm < minFM) pauseReason = 'Low free margin';
     }
   }
 
@@ -250,7 +254,14 @@
 
   // ==== Throttle / Open Orders Failsafe ====
   const cycleDue = now - S.lastCycleTs > S.cooldownMs;
-  const tol = S.cancelTolerancePct * (price > 0 ? price : 1);
+  const pxUnit = (price > 0 ? price : 1);
+  const tol = S.cancelTolerancePct * pxUnit;
+  const replaceTriggerPct = (Number.isFinite(S.replaceTriggerPct) && S.replaceTriggerPct > 0)
+    ? S.replaceTriggerPct
+    : Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
+  const replaceTriggerAbs = replaceTriggerPct * pxUnit;
+  const cancelTriggerAbs = Math.max(replaceTriggerAbs * 1.75, pxUnit * S.gridStepPct);
+  const matchTolerance = Math.max(tol, replaceTriggerAbs * 0.5);
 
   // === Open Orders Failsafe (NY) ===
   let oo = [];
@@ -551,7 +562,7 @@
 
   // ==== Visuals (frivilligt i GUI) ====
   const makeLine = (txt, px, color) => ({
-    text: txt, price: px, lineStyle: 2, lineWidth: 1, lineColor: color,
+    text: txt, price: px, lineStyle: 2, lineWidth: 0.6, lineColor: color,
     bodyBackgroundColor: '#fff', quantityBackgroundColor: '#1f1f1f'
   });
   const lines = [ makeLine('Grid Center', S.center, S.paused ? '#999' : '#78a6ff') ];
