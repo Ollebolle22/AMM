@@ -1,46 +1,55 @@
 /**
  * Gunbot Derivatives Grid MM – robust, role-based (LONG/SHORT)
- * - Fungerar även utan candles-historik
+ * - Fungerar utan candles-historik
  * - Inventory- & margin-aware
- * - Recenter + skew mot motsatt håll
- * - Städar felplacerade ordrar, throttlar orderläggning
+ * - Recenter + skew
+ * - Städar/ersätter felplacerade ordrar, throttlar läggning
  * - Failsafe för prisdata, fri marginal, openOrders-API (med backoff)
- * - Utökade metrics i sidopanelen: Unrealized/Realized PnL, ROE, CAGR, MaxDD,
- *   HODL-jämförelse (USDT/COIN), % till likvid/BE, approx MM% m.m.
+ * - Utökade metrics i sidopanelen
  * Node 14.4. Ingen ||=.
  */
 
 (async () => {
-  // ==== Grundkrav ====
+  // ==== Grundkrav ====  (namespacat state per roll)
   if (!gb || !gb.data || !gb.data.pairLedger) { console.log('[GRID] missing gb.data'); return; }
-  if (!gb.data.pairLedger.customStratStore || typeof gb.data.pairLedger.customStratStore !== 'object') {
-    gb.data.pairLedger.customStratStore = {};
-  }
-  const S = gb.data.pairLedger.customStratStore;
+  const pl = gb.data.pairLedger;
+  if (typeof pl._gridStores !== 'object' || !pl._gridStores) pl._gridStores = {};
+  const roleKey = (
+    (gb && typeof gb.role === 'string' && gb.role) ||
+    (gb && gb.envRole) ||
+    (pl.customStratStore && typeof pl.customStratStore.role === 'string' && pl.customStratStore.role) ||
+    'long'
+  ).toLowerCase();
+  if (!pl._gridStores[roleKey]) pl._gridStores[roleKey] = {};
+  const S = pl._gridStores[roleKey];
+  if (typeof S.role !== 'string') S.role = roleKey;  // 'long' | 'short'
 
   // ==== Defaults (ändra i runtime via customStratStore) ====
-  if (typeof S.role !== 'string') S.role = 'long';            // 'long' eller 'short'
-  if (typeof S.gridStepPct !== 'number') S.gridStepPct = 0.003; // 0.3%
-  if (typeof S.levelsPerSide !== 'number') S.levelsPerSide = 6;
-  if (typeof S.allocPct !== 'number') S.allocPct = 0.25;        // andel av fri marginal att lägga ut
-  if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;      // max inventory vs equity
-  if (typeof S.skewK !== 'number') S.skewK = 0.8;               // styrka för inventory-skew
+  if (typeof S.gridStepPct !== 'number') S.gridStepPct = 0.003;
+  if (typeof S.levelsPerSide !== 'number') S.levelsPerSide = 2;
+  if (typeof S.allocPct !== 'number') S.allocPct = 0.05;          // 5% av fri marginal
+  if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;
+  if (typeof S.skewK !== 'number') S.skewK = 0.8;
   if (typeof S.recenterEveryMs !== 'number') S.recenterEveryMs = 60_000;
   if (typeof S.cancelTolerancePct !== 'number') S.cancelTolerancePct = 0.20 / 100; // 0.20%
   if (typeof S.replaceTriggerPct !== 'number') {
     const defaultTrigger = Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
-    S.replaceTriggerPct = defaultTrigger;            // min. prisförflyttning (% av pris) innan vi ersätter order
+    S.replaceTriggerPct = defaultTrigger;
   }
-  if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;
-  if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = 50;
+  if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;      // du har 6s exchange delay externt
+  if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = Math.max(4, 2 * (S.levelsPerSide || 2)); // tak per instans
   if (typeof S.minBaseAmt !== 'number') S.minBaseAmt = 1e-9;
   if (typeof S.usePostOnly !== 'boolean') S.usePostOnly = false;
-  if (typeof S.trimInsidePct !== 'number') S.trimInsidePct = 0.25; // liten trim nära center
+  if (typeof S.trimInsidePct !== 'number') S.trimInsidePct = 0;   // inga trims nära center
   if (typeof S.localOrderTimeoutMs !== 'number') S.localOrderTimeoutMs = 15_000;
 
-  // Valfria steg för avrundning (fyll rätt steg för paret vid behov)
-  if (typeof S.qtyStep !== 'number') S.qtyStep = 0;    // t.ex. 0.1 DOGE, 0 = ingen avrundning
-  if (typeof S.priceStep !== 'number') S.priceStep = 0; // t.ex. 0.0001 USDT, 0 = ingen avrundning
+  // Tick/lot defaults (justera per instrument vid behov)
+  if (typeof S.priceStep !== 'number') S.priceStep = 0.0001; // ex. DOGEUSDT
+  if (typeof S.qtyStep !== 'number')   S.qtyStep   = 1;      // ex. 1 DOGE
+
+  // Orderstorleksregler
+  if (typeof S.minOrderQuote !== 'number') S.minOrderQuote = 5;     // min 5 USDT per order
+  if (typeof S.maxOrderQuotePct !== 'number') S.maxOrderQuotePct = 0.01; // max 1% av equity per order
 
   // Failsafe
   if (typeof S.failsafeEnabled !== 'boolean') S.failsafeEnabled = true;
@@ -52,26 +61,26 @@
 
   // Extra failsafe-state
   if (typeof S.openOrdersFailSince !== 'number') S.openOrdersFailSince = 0;
-  if (typeof S.apiBackoffUntil !== 'number') S.apiBackoffUntil = 0; // epoch ms
-  if (typeof S.apiBackoffMs !== 'number') S.apiBackoffMs = 0;       // senaste backoffvärde
-  if (typeof S.apiBackoffMax !== 'number') S.apiBackoffMax = 120_000; // max 2m backoff
+  if (typeof S.apiBackoffUntil !== 'number') S.apiBackoffUntil = 0;
+  if (typeof S.apiBackoffMs !== 'number') S.apiBackoffMs = 0;
+  if (typeof S.apiBackoffMax !== 'number') S.apiBackoffMax = 120_000;
   if (typeof S.apiFailCount !== 'number') S.apiFailCount = 0;
   if (typeof S.lastApiError !== 'string') S.lastApiError = '';
 
-  // Manuell center-reset flag
+  // Manuell center-reset
   if (typeof S.resetCenter !== 'boolean') S.resetCenter = false;
 
-  // Metrics state (egna beräkningar)
+  // Metrics state
   if (typeof S.startTs !== 'number') S.startTs = 0;
   if (typeof S.startEquity !== 'number') S.startEquity = 0;
   if (typeof S.startPrice !== 'number') S.startPrice = 0;
-  if (typeof S.hodlQty !== 'number') S.hodlQty = 0;     // HODL_COINS: hur många coins vid start
-  if (!Array.isArray(S.eqHist)) S.eqHist = [];           // [{t, eq, p}]
+  if (typeof S.hodlQty !== 'number') S.hodlQty = 0;
+  if (!Array.isArray(S.eqHist)) S.eqHist = [];
   if (typeof S.eqPeak !== 'number') S.eqPeak = 0;
-  if (typeof S.maxDD !== 'number') S.maxDD = 0;          // i %
-  if (typeof S.realizedPnL !== 'number') S.realizedPnL = 0; // proxy
-  if (typeof S.lastFlatEq !== 'number') S.lastFlatEq = 0;   // equity när vi senast var helt flat
-  if (typeof S.wasFlat !== 'boolean') S.wasFlat = true;     // var vi flat förra cykeln?
+  if (typeof S.maxDD !== 'number') S.maxDD = 0;
+  if (typeof S.realizedPnL !== 'number') S.realizedPnL = 0;
+  if (typeof S.lastFlatEq !== 'number') S.lastFlatEq = 0;
+  if (typeof S.wasFlat !== 'boolean') S.wasFlat = true;
 
   // State
   const now = Date.now();
@@ -88,19 +97,16 @@
   const price = bid > 0 && ask > 0 ? (bid + ask) / 2 : Math.max(bid, ask);
   const priceOk = (bid > 0 && ask > 0 && ask >= bid);
   if (priceOk) S.lastGoodTs = now;
-  if (!(price > 0)) {
-    // Pris saknas. Visa status men lägg inte ordrar.
-    S.paused = true; S.lastPauseReason = 'Price data missing';
-  }
+  if (!(price > 0)) { S.paused = true; S.lastPauseReason = 'Price data missing'; }
 
   // Derivatdata
   const wallet = Number.isFinite(gb.data.walletBalance) ? gb.data.walletBalance : 0; // quote
-  const qty = Number.isFinite(gb.data.currentQty) ? gb.data.currentQty : 0;          // base (+ long, - short)
-  const breakEven = Number.isFinite(gb.data.breakEven) ? gb.data.breakEven : 0;     // 0 om okänt
+  const qty = Number.isFinite(gb.data.currentQty) ? gb.data.currentQty : 0;          // base
+  const breakEven = Number.isFinite(gb.data.breakEven) ? gb.data.breakEven : 0;
   const liq = Number.isFinite(gb.data.liquidationPrice) ? gb.data.liquidationPrice : 0;
   if (typeof S.leverage !== 'number') S.leverage = 10;
 
-  // === Robust equity/marginal (hantera okänt breakEven) ===
+  // === Equity/marginal ===
   const equity = () => {
     const effectiveBE = (breakEven > 0 ? breakEven : price);
     const pnl = (price > 0 && effectiveBE > 0) ? qty * (price - effectiveBE) : 0;
@@ -109,20 +115,14 @@
   const marginUsed = () => Math.abs(qty) * (price > 0 ? price : 1) / Math.max(1, S.leverage);
   const freeMargin = () => Math.max(0, equity() - marginUsed());
 
-  const safePromise = (fn) => {
-    try { return Promise.resolve(fn()); }
-    catch (err) { return Promise.reject(err); }
-  };
+  const safePromise = (fn) => { try { return Promise.resolve(fn()); } catch (err) { return Promise.reject(err); } };
 
   const callWithTimeout = async (promise, ms, label) => {
     let timer;
     const timeoutErr = new Error(`local-timeout ${label} after ${ms}ms`);
     const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutErr), Math.max(1, ms)); });
-    try {
-      return await Promise.race([promise, timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    try { return await Promise.race([promise, timeout]); }
+    finally { if (timer) clearTimeout(timer); }
   };
 
   const markApiFailure = (reason) => {
@@ -152,26 +152,19 @@
 
   const clearApiFailure = () => {
     if (S.apiBackoffMs !== 0 || S.apiFailCount !== 0 || (S.lastApiError && S.lastApiError.length)) {
-      S.apiFailCount = 0;
-      S.apiBackoffMs = 0;
-      S.apiBackoffUntil = 0;
+      S.apiFailCount = 0; S.apiBackoffMs = 0; S.apiBackoffUntil = 0;
       if (S.lastApiError && S.lastApiError.length) {
-        gb.data.pairLedger.notifications = [
-          { text: 'API recovered. Resuming.', variant: 'success', persist: false }
-        ];
+        gb.data.pairLedger.notifications = [{ text: 'API recovered. Resuming.', variant: 'success', persist: false }];
       }
       S.lastApiError = '';
     }
   };
 
-  // Initiera metrics första gången vi har giltig data
+  // Init metrics
   if (price > 0 && equity() > 0 && S.startTs === 0) {
-    S.startTs = now;
-    S.startEquity = equity();
-    S.startPrice = price;
+    S.startTs = now; S.startEquity = equity(); S.startPrice = price;
     S.hodlQty = S.startPrice > 0 ? (S.startEquity / S.startPrice) : 0;
-    S.eqPeak = S.startEquity;
-    S.lastFlatEq = S.startEquity; // bas för realized PnL
+    S.eqPeak = S.startEquity; S.lastFlatEq = S.startEquity;
     console.log('[GRID] metrics init startEq=', S.startEquity.toFixed(4), 'startP=', S.startPrice.toFixed(8));
   }
 
@@ -204,23 +197,24 @@
   const stepAbs = (price > 0 ? price : 1) * Math.max(0.0001, S.gridStepPct);
   const centerTarget = price > 0 ? (price - S.skewK * invRatio * stepAbs) : (S.center || 0);
 
-  // Adaptiv recenter: lägre tröskel vid små gridsteg
   const drift = price > 0 ? Math.abs((S.center - centerTarget) / price) : 0;
-  const driftThreshold = Math.max(0.001, S.gridStepPct / 2); // minst 0.1% eller halva gridsteget
+  const driftThreshold = Math.max(0.001, S.gridStepPct / 2);
   const needRecenter = (now - S.lastRecenterTs > S.recenterEveryMs) || (drift > driftThreshold);
 
-  // Manuell reset
   if (S.resetCenter && price > 0) {
-    S.center = price;
-    S.lastRecenterTs = now;
-    S.resetCenter = false;
-    gb.data.pairLedger.notifications = [
-      { text: `Manual center reset to ${price.toFixed(6)}`, variant: 'info', persist: false }
-    ];
+    S.center = price; S.lastRecenterTs = now; S.resetCenter = false;
+    gb.data.pairLedger.notifications = [{ text: `Manual center reset to ${price.toFixed(6)}`, variant: 'info', persist: false }];
   } else if (needRecenter) {
-    S.center = centerTarget;
-    S.lastRecenterTs = now;
+    S.center = centerTarget; S.lastRecenterTs = now;
   }
+
+  // ==== Hjälpare ====
+  const roundToStep = (v, step) => {
+    if (!Number.isFinite(v)) return 0;
+    if (!Number.isFinite(step) || step <= 0) return v;
+    return Math.round(v / step) * step;
+  };
+  const toQuote = (px, base) => Math.max(0, (Number.isFinite(px)?px:0) * (Number.isFinite(base)?base:0));
 
   // ==== Bygg grid ====
   const levels = Math.max(1, Math.min(S.levelsPerSide, 25));
@@ -228,42 +222,59 @@
   const weights = []; for (let i = 1; i <= levels; i++) weights.push(1 / i);
   const wSum = weights.reduce((a, b) => a + b, 0);
 
-  // Hjälpare för avrundning
-  const roundToStep = (v, step) => {
-    if (!Number.isFinite(v)) return 0;
-    if (!Number.isFinite(step) || step <= 0) return v;
-    return Math.round(v / step) * step;
-  };
-
   const bids = []; const asks = [];
   const sizeBaseB = []; const sizeBaseA = [];
   for (let i = 1; i <= levels; i++) {
     let b = S.center - i * stepAbs;
     let a = S.center + i * stepAbs;
-    b = roundToStep(b, S.priceStep);
-    a = roundToStep(a, S.priceStep);
+    b = roundToStep(b, S.priceStep); a = roundToStep(a, S.priceStep);
     bids.push(b); asks.push(a);
 
+    // preliminär per-nivå quote-vikt
     const perLevelQuote = allocQuote * (weights[i - 1] / wSum);
+
+    // basmängd från budget
     let baseAmt = perLevelQuote / Math.max(1e-9, (price > 0 ? price : 1));
     if (!Number.isFinite(baseAmt) || baseAmt <= 0) baseAmt = 0;
-    baseAmt = Math.max(S.minBaseAmt, baseAmt);
-    baseAmt = roundToStep(baseAmt, S.qtyStep);
-    sizeBaseB.push(baseAmt); sizeBaseA.push(baseAmt);
+
+    // MIN 5 USDT
+    if (toQuote(price, baseAmt) < S.minOrderQuote) {
+      baseAmt = S.minOrderQuote / Math.max(1e-9, price);
+    }
+
+    // MAX X% av equity
+    const eqNow = equity();
+    const eqForCap = (S.startEquity > 0 ? S.startEquity : eqNow);
+    const maxQuote = Math.max(0, eqForCap * S.maxOrderQuotePct);
+    if (maxQuote > 0 && toQuote(price, baseAmt) > maxQuote) {
+      baseAmt = maxQuote / Math.max(1e-9, price);
+    }
+
+    // avrunda till lot-steg och min bas
+    baseAmt = Math.max(S.minBaseAmt, roundToStep(baseAmt, S.qtyStep));
+
+    sizeBaseB.push(baseAmt); 
+    sizeBaseA.push(baseAmt);
   }
 
-  // ==== Throttle / Open Orders Failsafe ====
+  // ==== Throttle / toleranser ====
   const cycleDue = now - S.lastCycleTs > S.cooldownMs;
   const pxUnit = (price > 0 ? price : 1);
-  const tol = S.cancelTolerancePct * pxUnit;
+
+  const tolPct = S.cancelTolerancePct;
+  const tolAbs = tolPct * pxUnit;
+
   const replaceTriggerPct = (Number.isFinite(S.replaceTriggerPct) && S.replaceTriggerPct > 0)
     ? S.replaceTriggerPct
-    : Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
+    : Math.max(S.gridStepPct * 0.5, tolPct * 1.5);
   const replaceTriggerAbs = replaceTriggerPct * pxUnit;
   const cancelTriggerAbs = Math.max(replaceTriggerAbs * 1.75, pxUnit * S.gridStepPct);
-  const matchTolerance = Math.max(tol, replaceTriggerAbs * 0.5);
 
-  // === Open Orders Failsafe (NY) ===
+  // Tick-baserad matchning: minst halvt tick
+  const halfTick = (S.priceStep > 0 ? 0.51 * S.priceStep : 0);
+  const matchTolerance = Math.max(tolAbs, replaceTriggerAbs * 0.5, halfTick);
+
+  // === Open Orders Failsafe ===
   let oo = [];
   if (!Array.isArray(gb.data.openOrders)) {
     console.warn('[GRID] ⚠️ openOrders saknas – använder tom array');
@@ -271,10 +282,9 @@
     oo = [];
   } else {
     oo = gb.data.openOrders;
-    S.openOrdersFailSince = 0; // återställ om allt OK
+    S.openOrdersFailSince = 0;
   }
 
-  // Backoff: om openOrders saknas eller nyligen saknats, fördröj gridarbete
   let apiUnstable = false;
   if (S.failsafeEnabled) {
     if (S.openOrdersFailSince > 0) apiUnstable = true;
@@ -285,10 +295,8 @@
 
   if (S.failsafeEnabled && S.openOrdersFailSince > 0 && (now - S.openOrdersFailSince > 3 * S.cooldownMs)) {
     if (!pauseReason) pauseReason = 'openOrders missing or delayed';
-    // exponentiell backoff
     const next = S.apiBackoffMs > 0 ? Math.min(S.apiBackoffMs * 2, S.apiBackoffMax) : 10_000;
-    S.apiBackoffMs = next;
-    S.apiBackoffUntil = now + S.apiBackoffMs;
+    S.apiBackoffMs = next; S.apiBackoffUntil = now + S.apiBackoffMs;
     gb.data.pairLedger.notifications = [
       { text: `⚠️ openOrders timeout – pausar och backoff ${Math.round(next/1000)}s`, variant: 'error', persist: false }
     ];
@@ -299,15 +307,11 @@
   if (pauseReason) {
     if (!S.paused || changed) {
       S.paused = true; S.lastPauseReason = pauseReason;
-      gb.data.pairLedger.notifications = [
-        { text: `FAILSAFE: ${pauseReason}. Pausing orders.`, variant: 'error', persist: false }
-      ];
+      gb.data.pairLedger.notifications = [{ text: `FAILSAFE: ${pauseReason}. Pausing orders.`, variant: 'error', persist: false }];
     }
   } else if (S.paused) {
     S.paused = false; S.lastPauseReason = '';
-    gb.data.pairLedger.notifications = [
-      { text: 'Failsafe cleared. Resuming.', variant: 'success', persist: false }
-    ];
+    gb.data.pairLedger.notifications = [{ text: 'Failsafe cleared. Resuming.', variant: 'success', persist: false }];
   }
 
   // ==== Orderunderhåll + läggning ====
@@ -316,19 +320,23 @@
     const pushDesired = (side, px, amt, tag) => {
       if (!Number.isFinite(px) || px <= 0) return;
       if (!Number.isFinite(amt) || amt <= 0) return;
+      // dedup per sida+pris inom matchTolerance
+      for (const d of desired) {
+        if (d.side === side && Math.abs(d.px - px) <= matchTolerance) return;
+      }
       desired.push({ side, px, amt, matched: false, tag });
     };
     if (S.role === 'long') {
       for (let i = 0; i < bids.length; i++) pushDesired('buy', bids[i], sizeBaseB[i], `bid-${i}`);
-      const trims = Math.min(2, asks.length);
+      const trims = Math.min(0, asks.length); // trims avstängt via default, lämna 0
       for (let i = 0; i < trims; i++) pushDesired('sell', asks[i], sizeBaseA[i] * S.trimInsidePct, `trimAsk-${i}`);
     } else {
       for (let i = 0; i < asks.length; i++) pushDesired('sell', asks[i], sizeBaseA[i], `ask-${i}`);
-      const trims = Math.min(2, bids.length);
+      const trims = Math.min(0, bids.length); // trims avstängt
       for (let i = 0; i < trims; i++) pushDesired('buy', bids[i], sizeBaseB[i] * S.trimInsidePct, `trimBid-${i}`);
     }
 
-    // === Hjälpare för orderfält (robust mot olika börsformat) ===
+    // === Hjälpare för orderfält ===
     const rateFromOrder = (o) => {
       if (!o || typeof o !== 'object') return 0;
       const fields = ['rate', 'price', 'limit_price', 'orderPrice', 'avgPrice', 'avg_price', 'priceAvg'];
@@ -401,8 +409,7 @@
 
     const replaceOne = async (order, target) => {
       if (!canReplace || !order || !target) return false;
-      const id = idFromOrder(order);
-      if (!id) return false;
+      const id = idFromOrder(order); if (!id) return false;
       const qtyExisting = qtyFromOrder(order);
       const q = Number.isFinite(target.amt) && target.amt > 0 ? target.amt : qtyExisting;
       if (!Number.isFinite(q) || q <= 0) return false;
@@ -436,7 +443,7 @@
 
     const observedBook = [];
 
-    // Genomgång av befintliga ordrar: matcha, ersätt eller avbryt
+    // Matcha/ersätt/avbryt befintliga ordrar
     for (const o of oo) {
       if (S.apiBackoffUntil > Date.now()) break;
       const side = sideFromOrder(o);
@@ -451,17 +458,11 @@
       let handled = false;
       if (target) {
         const dist = Math.abs(rate - target.px);
-        if (dist <= replaceTriggerAbs) { // nära nog, lämna den
-          target.matched = true;
-          continue;
-        }
+        if (dist <= replaceTriggerAbs) { target.matched = true; continue; }
         handled = await replaceOne(o, target);
         if (!handled) {
           if (S.apiBackoffUntil > Date.now()) break;
-          if (dist < cancelTriggerAbs) { // för nära för att vara värt att cancella
-            target.matched = true;
-            continue;
-          }
+          if (dist < cancelTriggerAbs) { target.matched = true; continue; }
         }
       }
       if (!handled) {
@@ -473,26 +474,30 @@
 
     S.observedOrderBook = observedBook;
 
-    // Dubblettskydd (lokalt) under denna cykel
+    // Dubblettskydd över cykler
     if (!Array.isArray(S.recentPlaced)) S.recentPlaced = [];
-    // Purge gamla (äldre än 3*cooldown)
-    S.recentPlaced = S.recentPlaced.filter(x => now - x.ts <= 3 * S.cooldownMs);
+    S.recentPlaced = S.recentPlaced.filter(x => now - x.ts <= 10 * S.cooldownMs);
+
+    // Cache över observerade order för när openOrders är sena
+    if (!Array.isArray(S.observedCache)) S.observedCache = []; // [{side, px, ts}]
+    const cacheHorizonMs = 60_000;
+    S.observedCache = S.observedCache.filter(x => now - x.ts <= cacheHorizonMs);
+    for (const ob of observedBook) S.observedCache.push({ ...ob, ts: now });
 
     // Lägg saknade upp till gränser
     const openCount = oo.length;
-    let added = 0;
-    const maxAdd = Math.max(1, Math.min(10, S.maxActiveOrders));
+    const perSideCap = Math.max(1, Math.min(3, S.levelsPerSide)); // högst 3/side/cykel
+    const maxAdd     = Math.max(1, Math.min(4, S.maxActiveOrders)); // högst 4 totalt/cykel
 
     const placeOne = async (side, px, amt) => {
       try {
-        // Extra lokalt dubblettskydd: om vi nyss la nästan exakt denna
+        // skydd mot nära dubbletter
         for (const r of S.recentPlaced) {
-          if (r.side === side && Math.abs(r.px - px) <= tol) {
+          if (r.side === side && Math.abs(r.px - px) <= matchTolerance) {
             console.log('[GRID] skipped place (recent duplicate)', side, amt, '@', px);
             return false;
           }
         }
-
         const exec = () => {
           if (S.usePostOnly) {
             if (side === 'buy') return gb.method.buyLimitPostOnly(amt, px, pair, ex);
@@ -501,11 +506,10 @@
           if (side === 'buy') return gb.method.buyLimit(amt, px, pair, ex);
           return gb.method.sellLimit(amt, px, pair, ex);
         };
-
         await callWithTimeout(safePromise(exec), S.localOrderTimeoutMs, 'place order');
         clearApiFailure();
         S.recentPlaced.push({ side, px, ts: Date.now() });
-        observedBook.push({ side, px });
+        S.observedCache.push({ side, px, ts: Date.now() });
         console.log('[GRID]', S.role, 'placed', side, amt, '@', px);
         return true;
       } catch (e) {
@@ -515,39 +519,58 @@
       }
     };
 
-    const missing = desired.filter(d => !d.matched);
+    // Missing mål
+    let missing = desired.filter(d => !d.matched);
+
+    // slå ihop mål inom matchTolerance så bara ett per sida+pris återstår
+    const coalesce = [];
+    for (const d of missing) {
+      const hit = coalesce.find(x => x.side === d.side && Math.abs(x.px - d.px) <= matchTolerance);
+      if (!hit) coalesce.push(d);
+    }
+    missing = coalesce;
+
+    // räkna redan existerande nära våra mål
+    const haveSide = { buy: 0, sell: 0 };
+    for (const o of oo) {
+      const s = sideFromOrder(o);
+      const r = rateFromOrder(o);
+      if (s && r && desired.some(d => d.side === s && Math.abs(d.px - r) <= matchTolerance)) haveSide[s]++;
+    }
+    for (const c of S.observedCache) {
+      if (desired.some(d => d.side === c.side && Math.abs(d.px - c.px) <= matchTolerance)) haveSide[c.side]++;
+    }
+
+    let added = 0; const addedSide = { buy: 0, sell: 0 };
 
     if (S.apiBackoffUntil <= Date.now()) {
       for (const w of missing) {
         if (openCount + added >= S.maxActiveOrders || added >= maxAdd) break;
+        if (addedSide[w.side] >= perSideCap) continue;
 
-        // Existerar redan på börsen inom tolerans?
+        // finns redan på börsen?
         let exists = false;
         for (const o of oo) {
-          const sameSide = sideFromOrder(o) === w.side;
-          const rate = rateFromOrder(o);
-          if (sameSide && Math.abs(rate - w.px) <= tol) { exists = true; break; }
+          if (sideFromOrder(o) === w.side && Math.abs(rateFromOrder(o) - w.px) <= matchTolerance) { exists = true; break; }
         }
         if (exists) continue;
 
-        // Finns i våra nyligen lagda (race-skydd)?
+        // nyligen lagd?
         let recentDup = false;
         for (const r of S.recentPlaced) {
-          if (r.side === w.side && Math.abs(r.px - w.px) <= tol) { recentDup = true; break; }
+          if (r.side === w.side && Math.abs(r.px - w.px) <= matchTolerance) { recentDup = true; break; }
         }
         if (recentDup) continue;
 
-        // Redan observerad i denna cykel?
-        if (Array.isArray(S.observedOrderBook)) {
-          let alreadySeen = false;
-          for (const ob of S.observedOrderBook) {
-            if (ob.side === w.side && Math.abs(ob.px - w.px) <= tol) { alreadySeen = true; break; }
-          }
-          if (alreadySeen) continue;
+        // redan observerad i cache?
+        let cached = false;
+        for (const c of S.observedCache) {
+          if (c.side === w.side && Math.abs(c.px - w.px) <= matchTolerance) { cached = true; break; }
         }
+        if (cached) continue;
 
         const ok = await placeOne(w.side, w.px, w.amt);
-        if (ok) added++;
+        if (ok) { added++; addedSide[w.side]++; }
         else if (S.apiBackoffUntil > Date.now()) break;
       }
     }
@@ -561,13 +584,12 @@
     S.lastCycleTs = now;
   }
 
-  // ==== Metrics & Sidebar (egna beräkningar) ====
+  // ==== Metrics & Sidebar ====
   const curEq = equity();
   const curP  = price > 0 ? price : 0;
   const lev = Math.max(1, S.leverage);
   const notional = Math.abs(qty) * curP;
 
-  // Historik: sampel var 30–60s (tunna ut via cooldown)
   if (curEq > 0 && curP > 0) {
     const lastPt = S.eqHist.length ? S.eqHist[S.eqHist.length-1] : null;
     if (!lastPt || now - lastPt.t > Math.max(30_000, S.cooldownMs)) {
@@ -576,17 +598,14 @@
     }
   }
 
-  // Peak & max drawdown
   if (curEq > S.eqPeak) S.eqPeak = curEq;
   const ddPct = S.eqPeak > 0 ? (1 - curEq / S.eqPeak) * 100 : 0;
   if (ddPct > S.maxDD) S.maxDD = ddPct;
 
-  // Unrealized PnL & ROE från start (proxy)
   const baseEq = (S.eqHist.length ? S.eqHist[0].eq : (S.startEquity || curEq));
   const uPnL = curEq - baseEq;
   const roePct = (S.startEquity > 0) ? (curEq / S.startEquity - 1) * 100 : 0;
 
-  // CAGR (årlig)
   let cagrPct = 0;
   if (S.startTs > 0 && curEq > 0 && S.startEquity > 0) {
     const years = Math.max(1/365, (now - S.startTs) / (365 * 24 * 3600 * 1000));
@@ -594,41 +613,33 @@
     cagrPct = cagr * 100;
   }
 
-  // HODL benchmarks
-  const hodlUSDT = S.startEquity || 0;                 // Håll bara kontant
-  const hodlCoinEq = S.hodlQty * curP;                 // Håll coin från start
-  const alphaUSDT = curEq - hodlUSDT;                  // över/under kontant baseline
-  const alphaCoin = curEq - hodlCoinEq;                // över/under coin-HODL
+  const hodlUSDT = S.startEquity || 0;
+  const hodlCoinEq = S.hodlQty * curP;
+  const alphaUSDT = curEq - hodlUSDT;
+  const alphaCoin = curEq - hodlCoinEq;
 
-  // % till likvid & % till BE
   let toLiqPct = 0;
   if (liq > 0 && curP > 0) {
-    if (qty >= 0) toLiqPct = ((curP - liq) / curP) * 100;   // long: hur långt ned till liq
-    else           toLiqPct = ((liq - curP) / curP) * 100;   // short: hur långt upp till liq
+    if (qty >= 0) toLiqPct = ((curP - liq) / curP) * 100;
+    else           toLiqPct = ((liq - curP) / curP) * 100;
   }
   const be = (breakEven > 0 ? breakEven : 0);
-  const toBEPct = (be > 0 && curP > 0) ? ((curP - be) / curP) * 100 : 0; // + över BE, - under BE
+  const toBEPct = (be > 0 && curP > 0) ? ((curP - be) / curP) * 100 : 0;
 
-  // Risk-/margin-nyckeltal (egna approximationer)
-  const mr = (curEq > 0) ? (marginUsed() / curEq) * 100 : 0;     // margin ratio (%)
-  const mmApproxPct = (typeof S.mmPct === 'number') ? S.mmPct : 0.5; // % av notional (approx)
+  const mr = (curEq > 0) ? (marginUsed() / curEq) * 100 : 0;
+  const mmApproxPct = (typeof S.mmPct === 'number') ? S.mmPct : 0.5;
   const maintMargin = (notional * mmApproxPct / 100);
 
-  // Realized PnL proxy: när positionen går från non-zero -> zero
   const flatNow = Math.abs(qty) < 1e-9;
   if (!S.wasFlat && flatNow) {
-    if (S.lastFlatEq === 0) S.lastFlatEq = curEq; // init om saknas
-    // ökning i equity sedan förra flat-tillfället betraktas som realized
+    if (S.lastFlatEq === 0) S.lastFlatEq = curEq;
     const delta = curEq - S.lastFlatEq;
     if (Number.isFinite(delta)) S.realizedPnL += delta;
-    S.lastFlatEq = curEq; // uppdatera bas
+    S.lastFlatEq = curEq;
   }
-  if (flatNow) {
-    if (S.lastFlatEq === 0) S.lastFlatEq = curEq;
-  }
+  if (flatNow) { if (S.lastFlatEq === 0) S.lastFlatEq = curEq; }
   S.wasFlat = flatNow;
 
-  // ==== Visuals (frivilligt i GUI) ====
   const makeLine = (txt, px, color) => ({
     text: txt, price: px, lineStyle: 2, lineWidth: 0.6, lineColor: color,
     bodyBackgroundColor: '#fff', quantityBackgroundColor: '#1f1f1f'
@@ -643,77 +654,52 @@
   for (let i = 0; i < Math.min(8, levels); i++) {
     const step = (price > 0 ? price : 1) * S.gridStepPct;
     const isNext = i === 0;
-    const bidColor = S.paused
-      ? buyColorPaused
-      : (isNext ? buyColorActive : buyColorNormal);
-    const askColor = S.paused
-      ? sellColorPaused
-      : (isNext ? sellColorActive : sellColorNormal);
+    const bidColor = S.paused ? buyColorPaused : (isNext ? buyColorActive : buyColorNormal);
+    const askColor = S.paused ? sellColorPaused : (isNext ? sellColorActive : sellColorNormal);
     lines.push(makeLine(`Bid L${i+1}`, S.center - (i+1) * step, bidColor));
     lines.push(makeLine(`Ask L${i+1}`, S.center + (i+1) * step, askColor));
   }
   gb.data.pairLedger.customChartTargets = lines;
 
-  // ==== Sidopanel ====
   const statusTxt = S.paused
     ? `PAUSED: ${S.lastPauseReason || 'unknown'}`
     : (backoffLeftSec > 0 ? `API BACKOFF (${backoffLeftSec}s)` : 'RUNNING');
   gb.data.pairLedger.sidebarExtras = [
     { label: 'Role', value: S.role.toUpperCase() },
     { label: 'Status', value: statusTxt, valueColor: S.paused ? '#ffb4a2' : '#b7f7c1' },
-
     { label: 'Price', value: (curP).toFixed(6) },
     { label: 'Center', value: S.center.toFixed(6) },
     { label: 'Step %', value: (S.gridStepPct * 100).toFixed(3) + '%' },
     { label: 'Levels/side', value: String(S.levelsPerSide) },
     { label: 'Skew', value: S.skewK.toFixed(2) },
     { label: 'Alloc %', value: (S.allocPct * 100).toFixed(0) + '%' },
-
     { label: 'Leverage', value: String(lev) + 'x' },
     { label: 'Wallet', value: (Number.isFinite(wallet) ? wallet : 0).toFixed(2) },
     { label: 'Equity (now)', value: (curEq).toFixed(2) },
     { label: 'Equity (start)', value: (S.startEquity || 0).toFixed(2) },
-
     { label: 'Unrealized PnL', value: (uPnL).toFixed(2) },
-    { label: 'Realized PnL*', value: (S.realizedPnL).toFixed(2), tooltip: 'Proxy: summering av equity-ökning vid flat events' },
+    { label: 'Realized PnL*', value: (S.realizedPnL).toFixed(2), tooltip: 'Proxy: equity-ökning vid flat events' },
     { label: 'ROE %', value: roePct.toFixed(2) + '%' },
     { label: 'CAGR % (annual)', value: cagrPct.toFixed(2) + '%' },
-
     { label: 'Max DD %', value: (S.maxDD).toFixed(2) + '%' },
     { label: 'Notional', value: notional.toFixed(2) },
     { label: 'Margin used', value: marginUsed().toFixed(2) },
-    { label: 'Margin ratio %', value: mr.toFixed(2) + '%' },
-
+    { label: 'Margin ratio %', value: ((curEq>0)?(marginUsed()/curEq*100):0).toFixed(2) + '%' },
     { label: 'Liq price', value: (liq || 0).toFixed(6) },
-    { label: '% to Liq', value: toLiqPct.toFixed(2) + '%' },
-    { label: 'BreakEven', value: (be || 0).toFixed(6) },
-    { label: '% vs BE', value: toBEPct.toFixed(2) + '%' },
-
-    { label: 'HODL(USDT) Eq', value: (hodlUSDT).toFixed(2) },
-    { label: 'α vs HODL(USDT)', value: (alphaUSDT).toFixed(2) },
-    { label: 'HODL(COIN) Eq', value: (hodlCoinEq).toFixed(2) },
-    { label: 'α vs HODL(COIN)', value: (alphaCoin).toFixed(2) },
-
-    { label: 'Maint. Margin ~', value: maintMargin.toFixed(2), tooltip: 'Approx baserat på S.mmPct' },
+    { label: '% to Liq', value: ((liq>0 && curP>0)?(qty>=0?((curP-liq)/curP*100):((liq-curP)/curP*100)):0).toFixed(2) + '%' },
+    { label: 'BreakEven', value: (breakEven || 0).toFixed(6) },
+    { label: '% vs BE', value: ((breakEven>0 && curP>0)?((curP-breakEven)/curP*100):0).toFixed(2) + '%' },
+    { label: 'HODL(USDT) Eq', value: (S.startEquity || 0).toFixed(2) },
+    { label: 'α vs HODL(USDT)', value: (curEq - (S.startEquity || 0)).toFixed(2) },
+    { label: 'HODL(COIN) Eq', value: (S.hodlQty * curP).toFixed(2) },
+    { label: 'α vs HODL(COIN)', value: (curEq - S.hodlQty * curP).toFixed(2) },
+    { label: 'Maint. Margin ~', value: ((Math.abs(qty)*curP) * ((typeof S.mmPct==='number')?S.mmPct:0.5) / 100).toFixed(2), tooltip: 'Approx baserat på S.mmPct' },
     { label: 'Open orders', value: String(Array.isArray(gb.data.openOrders) ? gb.data.openOrders.length : 0) },
-    {
-      label: 'Orders fail since',
-      value: S.openOrdersFailSince ? new Date(S.openOrdersFailSince).toLocaleTimeString() : '-',
-      tooltip: 'Tidpunkt då openOrders senast saknades'
-    },
-    {
-      label: 'API backoff',
-      value: S.apiBackoffUntil > now ? `${Math.ceil((S.apiBackoffUntil - now)/1000)}s` : '-',
-      tooltip: 'Backoff-interval vid API-fel'
-    },
-    {
-      label: 'API last err',
-      value: S.lastApiError && S.lastApiError.length ? (S.lastApiError.length > 36 ? S.lastApiError.slice(0, 33) + '…' : S.lastApiError) : '-',
-      tooltip: S.lastApiError && S.lastApiError.length ? S.lastApiError : 'Senaste API-felmeddelande'
-    },
+    { label: 'Orders fail since', value: S.openOrdersFailSince ? new Date(S.openOrdersFailSince).toLocaleTimeString() : '-', tooltip: 'Tidpunkt då openOrders senast saknades' },
+    { label: 'API backoff', value: S.apiBackoffUntil > now ? `${Math.ceil((S.apiBackoffUntil - now)/1000)}s` : '-', tooltip: 'Backoff-interval vid API-fel' },
+    { label: 'API last err', value: S.lastApiError && S.lastApiError.length ? (S.lastApiError.length > 36 ? S.lastApiError.slice(0, 33) + '…' : S.lastApiError) : '-', tooltip: S.lastApiError && S.lastApiError.length ? S.lastApiError : 'Senaste API-felmeddelande' },
     { label: 'API fail count', value: String(S.apiFailCount || 0) },
   ];
 
-  // ==== Log ====
   console.log(`[GRID] role=${S.role} status=${statusTxt} reason=${S.lastPauseReason||'-'} backoff=${backoffLeftSec}s p=${(price>0?price:0).toFixed(6)} center=${S.center.toFixed(6)} step%=${(S.gridStepPct*100).toFixed(3)} levels=${S.levelsPerSide}`);
 })();
