@@ -348,7 +348,7 @@
       for (const d of desired) {
         if (d.matched) continue;
         if (d.side !== side) continue;
-        if (Math.abs(rate - d.px) <= matchTolerance) return d;
+        if (Math.abs(rate - d.px) <= tol) return d;
       }
       return null;
     };
@@ -408,21 +408,7 @@
       }
       const target = findClosestTarget(side, rate);
       let handled = false;
-      if (target) {
-        const dist = Math.abs(rate - target.px);
-        if (dist <= replaceTriggerAbs) {
-          target.matched = true;
-          continue;
-        }
-        handled = await replaceOne(o, target);
-        if (!handled) {
-          if (S.apiBackoffUntil > Date.now()) break;
-          if (dist < cancelTriggerAbs) {
-            target.matched = true;
-            continue;
-          }
-        }
-      }
+      if (target) handled = await replaceOne(o, target);
       if (!handled) {
         if (S.apiBackoffUntil > Date.now()) break;
         await cancelOne(o.id);
