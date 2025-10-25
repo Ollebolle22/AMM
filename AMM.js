@@ -48,7 +48,7 @@
   if (typeof S.qtyStep !== 'number')   S.qtyStep   = 1;      // ex. 1 DOGE
 
   // Orderstorleksregler
-  if (typeof S.minOrderQuote !== 'number') S.minOrderQuote = 5;     // min 5 USDT per order
+  if (typeof S.minOrderQuote !== 'number') S.minOrderQuote = 5;        // min 5 USDT per order
   if (typeof S.maxOrderQuotePct !== 'number') S.maxOrderQuotePct = 0.01; // max 1% av equity per order
 
   // Failsafe
@@ -81,10 +81,13 @@
   if (typeof S.realizedPnL !== 'number') S.realizedPnL = 0;
   if (typeof S.lastFlatEq !== 'number') S.lastFlatEq = 0;
   if (typeof S.wasFlat !== 'boolean') S.wasFlat = true;
+
+  // Extra state för orkestrering
   if (typeof S.lastFillTs !== 'number') S.lastFillTs = 0;
   if (typeof S.forceImmediateCycle !== 'boolean') S.forceImmediateCycle = false;
   if (typeof S.forceRecenter !== 'boolean') S.forceRecenter = false;
   if (!Array.isArray(S.lastKnownOrders)) S.lastKnownOrders = [];
+  if (!Array.isArray(S.lastDesiredShape)) S.lastDesiredShape = [];
 
   // State
   const now = Date.now();
@@ -234,19 +237,15 @@
     b = roundToStep(b, S.priceStep); a = roundToStep(a, S.priceStep);
     bids.push(b); asks.push(a);
 
-    // preliminär per-nivå quote-vikt
     const perLevelQuote = allocQuote * (weights[i - 1] / wSum);
 
-    // basmängd från budget
     let baseAmt = perLevelQuote / Math.max(1e-9, (price > 0 ? price : 1));
     if (!Number.isFinite(baseAmt) || baseAmt <= 0) baseAmt = 0;
 
-    // MIN 5 USDT
     if (toQuote(price, baseAmt) < S.minOrderQuote) {
       baseAmt = S.minOrderQuote / Math.max(1e-9, price);
     }
 
-    // MAX X% av equity
     const eqNow = equity();
     const eqForCap = (S.startEquity > 0 ? S.startEquity : eqNow);
     const maxQuote = Math.max(0, eqForCap * S.maxOrderQuotePct);
@@ -254,10 +253,9 @@
       baseAmt = maxQuote / Math.max(1e-9, price);
     }
 
-    // avrunda till lot-steg och min bas
     baseAmt = Math.max(S.minBaseAmt, roundToStep(baseAmt, S.qtyStep));
 
-    sizeBaseB.push(baseAmt); 
+    sizeBaseB.push(baseAmt);
     sizeBaseA.push(baseAmt);
   }
 
@@ -275,14 +273,13 @@
   const replaceTriggerAbs = replaceTriggerPct * pxUnit;
   const cancelTriggerAbs = Math.max(replaceTriggerAbs * 1.75, pxUnit * S.gridStepPct);
 
-  // Tick-baserad matchning: minst halvt tick
   const halfTick = (S.priceStep > 0 ? 0.51 * S.priceStep : 0);
   const matchTolerance = Math.max(tolAbs, replaceTriggerAbs * 0.5, halfTick);
 
   // === Open Orders Failsafe ===
   let oo = [];
   if (!Array.isArray(gb.data.openOrders)) {
-    console.warn('[GRID] ⚠️ openOrders saknas – använder tom array');
+    console.warn('[GRID] openOrders saknas – använder tom array');
     if (!S.openOrdersFailSince) S.openOrdersFailSince = now;
     oo = [];
   } else {
@@ -300,8 +297,50 @@
 
   if (!Array.isArray(S.observedCache)) S.observedCache = [];
 
+  // === Hjälpare för orderfält (behövs tidigt) ===
+  const rateFromOrder = (o) => {
+    if (!o || typeof o !== 'object') return 0;
+    const fields = ['rate', 'price', 'limit_price', 'orderPrice', 'avgPrice', 'avg_price', 'priceAvg'];
+    for (const f of fields) {
+      if (!(f in o)) continue;
+      const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
+      if (Number.isFinite(num) && num > 0) return num;
+    }
+    return 0;
+  };
+  const sideFromOrder = (o) => {
+    if (!o || typeof o !== 'object') return '';
+    const raw = o.type || o.side || o.orderSide || o.positionSide;
+    if (!raw) return '';
+    const txt = String(raw).toLowerCase();
+    if (txt.startsWith('buy') || txt === 'long' || txt === '1') return 'buy';
+    if (txt.startsWith('sell') || txt === 'short' || txt === '2') return 'sell';
+    return '';
+  };
+  const idFromOrder = (o) => {
+    if (!o || typeof o !== 'object') return '';
+    const fields = ['id', 'orderId', 'order_id', 'clientOrderId', 'client_order_id', 'clOrdID'];
+    for (const f of fields) {
+      const v = o[f];
+      if (v !== undefined && v !== null && String(v).length) return String(v);
+    }
+    return '';
+  };
+  const qtyFromOrder = (o) => {
+    if (!o || typeof o !== 'object') return 0;
+    const fields = ['quantity', 'qty', 'amount', 'origQty', 'baseQuantity', 'size'];
+    for (const f of fields) {
+      if (!(f in o)) continue;
+      const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
+      if (Number.isFinite(num) && num > 0) return num;
+    }
+    return 0;
+  };
+
+  // Bygg nuvarande kända ordrar
   const currentKnownOrders = [];
   const curIdSet = new Set();
+  const curBySide = { buy: 0, sell: 0 };
   if (Array.isArray(oo)) {
     for (const ord of oo) {
       const id = idFromOrder(ord);
@@ -310,9 +349,11 @@
       const px = rateFromOrder(ord);
       currentKnownOrders.push({ id, side, px });
       curIdSet.add(id);
+      if (side === 'buy' || side === 'sell') curBySide[side]++;
     }
   }
 
+  // Detektera fyllda/ försvunna ordrar och saknade mål
   let fillDetected = false;
   const missingOrders = [];
   if (Array.isArray(S.lastKnownOrders) && S.lastKnownOrders.length) {
@@ -324,7 +365,28 @@
       }
     }
   }
-
+  if (Array.isArray(S.lastDesiredShape) && S.lastDesiredShape.length) {
+    for (const target of S.lastDesiredShape) {
+      if (!target || !target.side || !Number.isFinite(target.px)) continue;
+      const exists = currentKnownOrders.some(o => o.side === target.side && Math.abs((o.px || 0) - target.px) <= matchTolerance);
+      if (!exists) missingOrders.push({ side: target.side, px: target.px });
+    }
+    if (missingOrders.length) fillDetected = true;
+  }
+  if (missingOrders.length > 1) {
+    const seen = new Set();
+    const unique = [];
+    for (const m of missingOrders) {
+      if (!m) continue;
+      const key = `${m.side || ''}:${Number(m.px || 0).toFixed(8)}:${m.id || ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(m);
+    }
+    if (unique.length !== missingOrders.length) {
+      missingOrders.splice(0, missingOrders.length, ...unique);
+    }
+  }
   if (fillDetected) {
     S.lastFillTs = now;
     S.forceImmediateCycle = true;
@@ -342,7 +404,11 @@
         return !missingOrders.some(m => m && m.side === r.side && Math.abs((r.px || 0) - (m.px || 0)) <= cleanupTol);
       });
     }
-    console.log('[GRID]', S.role, 'orderfyllning upptäckt – triggar omplanering');
+    const missTxt = missingOrders
+      .map(m => m && m.side ? `${m.side}@${Number(m.px || 0).toFixed(6)}` : null)
+      .filter(Boolean)
+      .join(', ');
+    console.log('[GRID]', S.role, 'orderförlust upptäckt – triggar omplanering. Saknar:', missTxt || 'okända id:n');
   }
   S.lastKnownOrders = currentKnownOrders;
 
@@ -351,7 +417,6 @@
     S.lastRecenterTs = now;
     S.forceRecenter = false;
   }
-
   if (S.forceImmediateCycle) cycleDue = true;
 
   if (S.failsafeEnabled && S.openOrdersFailSince > 0 && (now - S.openOrdersFailSince > 3 * S.cooldownMs)) {
@@ -381,7 +446,6 @@
     const pushDesired = (side, px, amt, tag) => {
       if (!Number.isFinite(px) || px <= 0) return;
       if (!Number.isFinite(amt) || amt <= 0) return;
-      // dedup per sida+pris inom matchTolerance
       for (const d of desired) {
         if (d.side === side && Math.abs(d.px - px) <= matchTolerance) return;
       }
@@ -389,62 +453,24 @@
     };
     if (S.role === 'long') {
       for (let i = 0; i < bids.length; i++) pushDesired('buy', bids[i], sizeBaseB[i], `bid-${i}`);
-      const trims = Math.min(0, asks.length); // trims avstängt via default, lämna 0
+      const trims = Math.min(0, asks.length);
       for (let i = 0; i < trims; i++) pushDesired('sell', asks[i], sizeBaseA[i] * S.trimInsidePct, `trimAsk-${i}`);
     } else {
       for (let i = 0; i < asks.length; i++) pushDesired('sell', asks[i], sizeBaseA[i], `ask-${i}`);
-      const trims = Math.min(0, bids.length); // trims avstängt
+      const trims = Math.min(0, bids.length);
       for (let i = 0; i < trims; i++) pushDesired('buy', bids[i], sizeBaseB[i] * S.trimInsidePct, `trimBid-${i}`);
     }
 
-    // === Hjälpare för orderfält ===
-    const rateFromOrder = (o) => {
-      if (!o || typeof o !== 'object') return 0;
-      const fields = ['rate', 'price', 'limit_price', 'orderPrice', 'avgPrice', 'avg_price', 'priceAvg'];
-      for (const f of fields) {
-        if (!(f in o)) continue;
-        const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
-        if (Number.isFinite(num) && num > 0) return num;
-      }
-      return 0;
-    };
+    const desiredBuy = desired.filter(d => d.side === 'buy').length;
+    const desiredSell = desired.filter(d => d.side === 'sell').length;
 
-    const sideFromOrder = (o) => {
-      if (!o || typeof o !== 'object') return '';
-      const raw = o.type || o.side || o.orderSide || o.positionSide;
-      if (!raw) return '';
-      const txt = String(raw).toLowerCase();
-      if (txt.startsWith('buy') || txt === 'long' || txt === '1') return 'buy';
-      if (txt.startsWith('sell') || txt === 'short' || txt === '2') return 'sell';
-      return '';
-    };
-
-    const idFromOrder = (o) => {
-      if (!o || typeof o !== 'object') return '';
-      const fields = ['id', 'orderId', 'order_id', 'clientOrderId', 'client_order_id', 'clOrdID'];
-      for (const f of fields) {
-        const v = o[f];
-        if (v !== undefined && v !== null && String(v).length) return String(v);
-      }
-      return '';
-    };
-
-    const replaceMethodName =
-      (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder' :
-      (gb.method && typeof gb.method.amendOrder   === 'function') ? 'amendOrder'   :
-      (gb.method && typeof gb.method.editOrder    === 'function') ? 'editOrder'    : '';
-    const canReplace = Boolean(replaceMethodName);
-
-    const qtyFromOrder = (o) => {
-      if (!o || typeof o !== 'object') return 0;
-      const fields = ['quantity', 'qty', 'amount', 'origQty', 'baseQuantity', 'size'];
-      for (const f of fields) {
-        if (!(f in o)) continue;
-        const num = typeof o[f] === 'number' ? o[f] : Number(o[f]);
-        if (Number.isFinite(num) && num > 0) return num;
-      }
-      return 0;
-    };
+    console.log('[GRID]', S.role, 'cykelstart',
+      `pris=${Number(price || 0).toFixed(6)}`,
+      `öppna=${oo.length}`,
+      `mål=${desired.length}`,
+      `köpmål=${desiredBuy}`,
+      `säljmål=${desiredSell}`,
+      `backoff=${backoffLeftSec}s`);
 
     const findWithinTolerance = (side, rate) => {
       if (!Number.isFinite(rate) || rate <= 0) return null;
@@ -467,6 +493,12 @@
       }
       return best;
     };
+
+    const replaceMethodName =
+      (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder' :
+      (gb.method && typeof gb.method.amendOrder   === 'function') ? 'amendOrder'   :
+      (gb.method && typeof gb.method.editOrder    === 'function') ? 'editOrder'    : '';
+    const canReplace = Boolean(replaceMethodName);
 
     const replaceOne = async (order, target) => {
       if (!canReplace || !order || !target) return false;
@@ -552,7 +584,6 @@
 
     const placeOne = async (side, px, amt) => {
       try {
-        // skydd mot nära dubbletter
         for (const r of S.recentPlaced) {
           if (r.side === side && Math.abs(r.px - px) <= matchTolerance) {
             console.log('[GRID] skipped place (recent duplicate)', side, amt, '@', px);
@@ -591,6 +622,11 @@
     }
     missing = coalesce;
 
+    if (missing.length) {
+      const missTxt = missing.map(m => `${m.side}@${m.px.toFixed ? m.px.toFixed(6) : Number(m.px).toFixed(6)}`).join(', ');
+      console.log('[GRID]', S.role, 'saknar', missing.length, 'mål -> försöker lägga', missTxt);
+    }
+
     // räkna redan existerande nära våra mål
     const haveSide = { buy: 0, sell: 0 };
     for (const o of oo) {
@@ -609,26 +645,29 @@
         if (openCount + added >= S.maxActiveOrders || added >= maxAdd) break;
         if (addedSide[w.side] >= perSideCap) continue;
 
-        // finns redan på börsen?
         let exists = false;
         for (const o of oo) {
           if (sideFromOrder(o) === w.side && Math.abs(rateFromOrder(o) - w.px) <= matchTolerance) { exists = true; break; }
         }
         if (exists) continue;
 
-        // nyligen lagd?
         let recentDup = false;
         for (const r of S.recentPlaced) {
           if (r.side === w.side && Math.abs(r.px - w.px) <= matchTolerance) { recentDup = true; break; }
         }
         if (recentDup) continue;
 
-        // redan observerad i cache?
         let cached = false;
         for (const c of S.observedCache) {
-          if (c.side === w.side && Math.abs(c.px - w.px) <= matchTolerance) { cached = true; break; }
+          if (c.side === w.side && Math.abs(c.px - w.px) <= matchTolerance) {
+            if (now - c.ts <= S.cooldownMs) cached = true;
+            break;
+          }
         }
-        if (cached) continue;
+        if (cached) {
+          console.log('[GRID]', S.role, 'väntar med att lägga', w.side, '@', w.px, 'pga färsk cache');
+          continue;
+        }
 
         const ok = await placeOne(w.side, w.px, w.amt);
         if (ok) { added++; addedSide[w.side]++; }
@@ -641,9 +680,16 @@
         { text: `Rutnät ${S.role.toUpperCase()}: +${added} nya order`, variant: 'info', persist: false }
       ];
     }
+    if (added === 0 && missing.length > 0) {
+      console.log('[GRID]', S.role, 'kunde inte lägga om saknade order denna cykel');
+    }
+
+    S.lastDesiredShape = desired.map(d => ({ side: d.side, px: d.px }));
 
     S.lastCycleTs = now;
     S.forceImmediateCycle = false;
+  } else if (cycleDue) {
+    console.log('[GRID]', S.role, 'hoppar över cykel p.g.a.', S.paused ? `paus (${S.lastPauseReason||'-'})` : 'API-backoff');
   }
 
   // ==== Metrics & Sidebar ====
@@ -729,12 +775,8 @@
     lines.push(makeLine(`Köp nivå ${i + 1}`, S.center - (i + 1) * step, bidColor));
     lines.push(makeLine(`Sälj nivå ${i + 1}`, S.center + (i + 1) * step, askColor));
   }
-  if (be > 0) {
-    lines.push(makeLine('Break-even', be, '#ffd166', 3));
-  }
-  if (liq > 0) {
-    lines.push(makeLine('Likvidation', liq, '#ef476f', 3));
-  }
+  if (be > 0) lines.push(makeLine('Break-even', be, '#ffd166', 3));
+  if (liq > 0) lines.push(makeLine('Likvidation', liq, '#ef476f', 3));
   gb.data.pairLedger.customChartTargets = lines;
 
   const statusTxt = S.paused
@@ -764,7 +806,7 @@
     { label: '📊 Marginal använd', value: marginUsed().toFixed(2) },
     { label: '📊 Marginalkvot %', value: ((curEq > 0) ? (marginUsed() / curEq * 100) : 0).toFixed(2) + '%' },
     { label: '⚠️ Likvidationspris', value: (liq || 0).toFixed(6) },
-    { label: '⚠️ Avstånd till likvid %', value: (toLiqPct).toFixed(2) + '%' },
+    { label: '⚠️ Avstånd till likvid %', value: (((liq>0 && curP>0)?(qty>=0?((curP-liq)/curP*100):((liq-curP)/curP*100)):0)).toFixed(2) + '%' },
     { label: '🎯 Break-even', value: (breakEven || 0).toFixed(6) },
     { label: '🎯 Avstånd vs BE %', value: (toBEPct).toFixed(2) + '%' },
     { label: '💎 HODL (USDT)', value: (S.startEquity || 0).toFixed(2) },
@@ -779,5 +821,10 @@
     { label: '📟 API-felräknare', value: String(S.apiFailCount || 0) },
   ];
 
-  console.log(`[GRID] role=${S.role} status=${statusTxt} reason=${S.lastPauseReason||'-'} backoff=${backoffLeftSec}s p=${(price>0?price:0).toFixed(6)} center=${S.center.toFixed(6)} step%=${(S.gridStepPct*100).toFixed(3)} levels=${S.levelsPerSide}`);
+  const desiredTotal = Array.isArray(S.lastDesiredShape) ? S.lastDesiredShape.length : 0;
+  console.log(
+    `[GRID] role=${S.role} status=${statusTxt} reason=${S.lastPauseReason||'-'} backoff=${backoffLeftSec}s ` +
+    `p=${(price>0?price:0).toFixed(6)} center=${S.center.toFixed(6)} step%=${(S.gridStepPct*100).toFixed(3)} ` +
+    `levels=${S.levelsPerSide} öppna=${Array.isArray(oo)?oo.length:0} köp=${curBySide.buy} sälj=${curBySide.sell} mål=${desiredTotal}`
+  );
 })();
