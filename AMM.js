@@ -26,7 +26,6 @@
 
   // ==== Defaults (ändra i runtime via customStratStore) ====
   if (typeof S.gridStepPct !== 'number') S.gridStepPct = 0.003;
-  if (typeof S.levelsPerSide !== 'number') S.levelsPerSide = 3;
   if (typeof S.allocPct !== 'number') S.allocPct = 0.05;          // 5% av fri marginal
   if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;
   if (typeof S.skewK !== 'number') S.skewK = 0.8;
@@ -39,9 +38,56 @@
   if (typeof S.cooldownMs !== 'number') S.cooldownMs = 8000;      // t.ex. 6s exchange delay externt
   if (typeof S.minBaseAmt !== 'number') S.minBaseAmt = 1e-9;
   if (typeof S.usePostOnly !== 'boolean') S.usePostOnly = false;
-  if (typeof S.trimInsidePct !== 'number') S.trimInsidePct = 0.15; // trims nära center, 15% av normal storlek
-  if (typeof S.trimLevels !== 'number') S.trimLevels = 1;          // max 1 trim per sida
   if (typeof S.localOrderTimeoutMs !== 'number') S.localOrderTimeoutMs = 15_000;
+
+  // Samlad orderplan-konfiguration
+  if (!S.orderPlan || typeof S.orderPlan !== 'object') S.orderPlan = {};
+  const orderPlan = S.orderPlan;
+  const legacyLevels = Number.isFinite(S.levelsPerSide) ? S.levelsPerSide : 3;
+  const legacyTrims = Number.isFinite(S.trimLevels) ? S.trimLevels : 1;
+  const legacyMaxActive = Number.isFinite(S.maxActiveOrders)
+    ? S.maxActiveOrders
+    : 2 * legacyLevels + legacyTrims;
+  if (!Number.isFinite(orderPlan.levels)) orderPlan.levels = legacyLevels;
+  if (!Number.isFinite(orderPlan.trimLevels)) orderPlan.trimLevels = legacyTrims;
+  if (!Number.isFinite(orderPlan.maxActive)) orderPlan.maxActive = legacyMaxActive;
+  if (!Number.isFinite(orderPlan.maxPerCycle)) {
+    const fallbackCycle = Number.isFinite(S.maxAddPerCycle) ? S.maxAddPerCycle : Math.min(4, orderPlan.maxActive);
+    orderPlan.maxPerCycle = Math.max(1, fallbackCycle);
+  }
+  if (!Number.isFinite(orderPlan.placeSpacingMs)) {
+    const legacySpacing = Number.isFinite(S.placeSpacingMs) ? S.placeSpacingMs : 400;
+    orderPlan.placeSpacingMs = Math.max(0, legacySpacing);
+  }
+  if (!Number.isFinite(orderPlan.trimCooldownMs)) {
+    const legacyTrimCooldown = Number.isFinite(S.trimCooldownMs) ? S.trimCooldownMs : 15_000;
+    orderPlan.trimCooldownMs = Math.max(0, legacyTrimCooldown);
+  }
+  if (!Number.isFinite(orderPlan.maxReplacesPerCycle)) {
+    const legacyMaxReplace = Number.isFinite(S.maxReplacePerCycle)
+      ? S.maxReplacePerCycle
+      : Math.max(1, Math.floor(orderPlan.maxPerCycle / 2));
+    orderPlan.maxReplacesPerCycle = Math.max(0, legacyMaxReplace);
+  }
+  if (!Number.isFinite(orderPlan.replaceCooldownMs)) {
+    const legacyReplaceCooldown = Number.isFinite(S.replaceCooldownMs)
+      ? S.replaceCooldownMs
+      : Math.max(S.cooldownMs, 5_000);
+    orderPlan.replaceCooldownMs = Math.max(0, legacyReplaceCooldown);
+  }
+  if (!Number.isFinite(orderPlan.trimDistanceFactor)) {
+    const legacyTrimDistance = Number.isFinite(S.trimDistanceFactor) ? S.trimDistanceFactor : 0.35;
+    orderPlan.trimDistanceFactor = Math.max(0.05, Math.min(2, legacyTrimDistance));
+  }
+  if (!Number.isFinite(S.trimInsidePct)) S.trimInsidePct = 0.15; // trims nära center, 15% av normal storlek
+
+  // Spegla till legacy-fält för bakåtkompatibilitet i runtime-inställningar
+  S.levelsPerSide = orderPlan.levels;
+  S.trimLevels = orderPlan.trimLevels;
+  S.maxActiveOrders = orderPlan.maxActive;
+  S.maxReplacePerCycle = orderPlan.maxReplacesPerCycle;
+  S.replaceCooldownMs = orderPlan.replaceCooldownMs;
+  S.trimDistanceFactor = orderPlan.trimDistanceFactor;
 
   // Tick/lot defaults (justera per instrument vid behov)
   if (typeof S.priceStep !== 'number') S.priceStep = 0.0001; // ex. DOGEUSDT typiskt 0.0001
@@ -88,6 +134,7 @@
   if (typeof S.forceRecenter !== 'boolean') S.forceRecenter = false;
   if (!Array.isArray(S.lastKnownOrders)) S.lastKnownOrders = [];
   if (!Array.isArray(S.lastDesiredShape)) S.lastDesiredShape = [];
+  if (!S.replaceThrottle || typeof S.replaceThrottle !== 'object') S.replaceThrottle = {};
 
   // State
   const now = Date.now();
@@ -222,12 +269,10 @@
     return Math.round(v / step) * step;
   };
   const toQuote = (px, base) => Math.max(0, (Number.isFinite(px)?px:0) * (Number.isFinite(base)?base:0));
+  const pause = (ms) => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
 
   // ==== Bygg grid ====
-  const levels = Math.max(1, Math.min(S.levelsPerSide, 25));
-
-  // Sätt default för maxActiveOrders ENDAST om den inte redan är satt
-  if (typeof S.maxActiveOrders !== 'number') S.maxActiveOrders = 2 * S.levelsPerSide + S.trimLevels; // totalt ≈ huvudnivåer per sida
+  const levels = Math.max(1, Math.min(orderPlan.levels, 25));
 
   const allocQuote = freeMargin() * Math.max(0, Math.min(1, S.allocPct));
   const weights = []; for (let i = 1; i <= levels; i++) weights.push(1 / i);
@@ -446,6 +491,22 @@
 
   // ==== Orderunderhåll + läggning ====
   if (cycleDue && !S.paused && !apiUnstable) {
+    if (!S.trimThrottle || typeof S.trimThrottle !== 'object') S.trimThrottle = {};
+    const trimThrottle = S.trimThrottle;
+    const trimKeys = Object.keys(trimThrottle);
+    const trimExpiry = Math.max(orderPlan.trimCooldownMs * 4, 120_000);
+    for (const key of trimKeys) {
+      if (!Number.isFinite(trimThrottle[key]) || now - trimThrottle[key] > trimExpiry) delete trimThrottle[key];
+    }
+
+    if (!S.replaceThrottle || typeof S.replaceThrottle !== 'object') S.replaceThrottle = {};
+    const replaceThrottle = S.replaceThrottle;
+    const replaceKeys = Object.keys(replaceThrottle);
+    const replaceExpiry = Math.max((orderPlan.replaceCooldownMs || 0) * 4, 120_000);
+    for (const key of replaceKeys) {
+      if (!Number.isFinite(replaceThrottle[key]) || now - replaceThrottle[key] > replaceExpiry) delete replaceThrottle[key];
+    }
+
     // helper: minsta basmängd som motsvarar minOrderQuote
     const minBaseByQuote = (qPx) => roundToStep(S.minOrderQuote / Math.max(1e-9, qPx), S.qtyStep);
 
@@ -461,19 +522,26 @@
     };
 
     // primära grid-ordrar + trims
+    const trimGapFactor = Math.max(0.05, Math.min(2, orderPlan.trimDistanceFactor || 0));
+    const trimGapAbs = Math.max(S.priceStep || 0, stepAbs * trimGapFactor);
+
     if (S.role === 'long') {
       for (let i = 0; i < bids.length; i++) pushDesired('buy',  bids[i], sizeBaseB[i], `bid-${i}`);
       const trims = Math.min(S.trimLevels, asks.length);
       for (let i = 0; i < trims; i++) {
         const amt = Math.max(minBaseByQuote(price), roundToStep(sizeBaseA[i] * S.trimInsidePct, S.qtyStep));
-        pushDesired('sell', asks[i], amt, `trimAsk-${i}`);
+        const rawPx = price + (i + 1) * trimGapAbs;
+        const px = roundToStep(rawPx, S.priceStep);
+        if (px > 0) pushDesired('sell', px, amt, `trimAsk-${i}`);
       }
     } else {
       for (let i = 0; i < asks.length; i++) pushDesired('sell', asks[i], sizeBaseA[i], `ask-${i}`);
       const trims = Math.min(S.trimLevels, bids.length);
       for (let i = 0; i < trims; i++) {
         const amt = Math.max(minBaseByQuote(price), roundToStep(sizeBaseB[i] * S.trimInsidePct, S.qtyStep));
-        pushDesired('buy', bids[i], amt, `trimBid-${i}`);
+        const rawPx = price - (i + 1) * trimGapAbs;
+        const px = roundToStep(rawPx, S.priceStep);
+        if (px > 0) pushDesired('buy', px, amt, `trimBid-${i}`);
       }
     }
 
@@ -591,6 +659,11 @@
 
     const observedBook = [];
 
+    const maxReplacesPerCycle = (Number.isFinite(orderPlan.maxReplacesPerCycle) && orderPlan.maxReplacesPerCycle > 0)
+      ? orderPlan.maxReplacesPerCycle
+      : Infinity;
+    let replacedThisCycle = 0;
+
     // Matcha/ersätt/avbryt befintliga ordrar
     for (const o of oo) {
       if (S.apiBackoffUntil > Date.now()) break;
@@ -607,7 +680,19 @@
       if (target) {
         const dist = Math.abs(rate - target.px);
         if (dist <= replaceTriggerAbs) { target.matched = true; continue; }
+        const tagKey = target.tag && target.tag.length ? target.tag : `${target.side}@${target.px.toFixed(6)}`;
+        const cooldownMs = Math.max(0, orderPlan.replaceCooldownMs || 0);
+        const lastReplace = S.replaceThrottle[tagKey] || 0;
+        const withinCooldown = cooldownMs > 0 && (now - lastReplace) < cooldownMs;
+        const limitReached = replacedThisCycle >= maxReplacesPerCycle;
+        if (withinCooldown || limitReached) {
+          target.matched = true;
+          continue;
+        }
+        S.replaceThrottle[tagKey] = now;
         handled = await replaceOne(o, target);
+        if (handled) replacedThisCycle++;
+        if (orderPlan.placeSpacingMs > 0) await pause(orderPlan.placeSpacingMs);
         if (!handled) {
           if (S.apiBackoffUntil > Date.now()) break;
           if (dist < cancelTriggerAbs) { target.matched = true; continue; }
@@ -634,7 +719,7 @@
 
     // Lägg saknade upp till gränser
     const openCount = oo.length;
-    const maxAdd     = Math.max(1, Math.min(4, S.maxActiveOrders)); // högst 4 totalt/cykel
+    const maxAdd     = Math.max(1, Math.min(orderPlan.maxPerCycle, orderPlan.maxActive));
     let added = 0; const addedSide = { buy: 0, sell: 0 };
 
     const placeOne = async (side, px, amt, tag) => {
@@ -734,9 +819,21 @@
           continue;
         }
 
+        if (isTrim && orderPlan.trimCooldownMs > 0) {
+          const lastTrimTs = trimThrottle[w.tag] || 0;
+          if (now - lastTrimTs < orderPlan.trimCooldownMs) {
+            console.log('[GRID]', S.role, 'skipping trim', w.tag, '@', w.px, 'pga cooldown');
+            continue;
+          }
+        }
+
         const ok = await placeOne(w.side, w.px, w.amt, w.tag);
-        if (ok) { added++; addedSide[w.side]++; }
-        else if (S.apiBackoffUntil > Date.now()) break;
+        if (ok) {
+          added++; addedSide[w.side]++;
+          if (isTrim) trimThrottle[w.tag] = Date.now();
+        }
+        if (orderPlan.placeSpacingMs > 0) await pause(orderPlan.placeSpacingMs);
+        if (S.apiBackoffUntil > Date.now()) break;
       }
     }
 
