@@ -115,6 +115,7 @@
   if (typeof S.forceRecenter !== 'boolean') S.forceRecenter = false;
   if (!Array.isArray(S.lastKnownOrders)) S.lastKnownOrders = [];
   if (!Array.isArray(S.lastDesiredShape)) S.lastDesiredShape = [];
+  if (!S.replaceThrottle || typeof S.replaceThrottle !== 'object') S.replaceThrottle = {};
 
   // State
   const now = Date.now();
@@ -494,19 +495,26 @@
     };
 
     // primära grid-ordrar + trims
+    const trimGapFactor = Math.max(0.05, Math.min(2, orderPlan.trimDistanceFactor || 0));
+    const trimGapAbs = Math.max(S.priceStep || 0, stepAbs * trimGapFactor);
+
     if (S.role === 'long') {
       for (let i = 0; i < bids.length; i++) pushDesired('buy',  bids[i], sizeBaseB[i], `bid-${i}`);
       const trims = Math.min(S.trimLevels, asks.length);
       for (let i = 0; i < trims; i++) {
         const amt = Math.max(minBaseByQuote(price), roundToStep(sizeBaseA[i] * S.trimInsidePct, S.qtyStep));
-        pushDesired('sell', asks[i], amt, `trimAsk-${i}`);
+        const rawPx = price + (i + 1) * trimGapAbs;
+        const px = roundToStep(rawPx, S.priceStep);
+        if (px > 0) pushDesired('sell', px, amt, `trimAsk-${i}`);
       }
     } else {
       for (let i = 0; i < asks.length; i++) pushDesired('sell', asks[i], sizeBaseA[i], `ask-${i}`);
       const trims = Math.min(S.trimLevels, bids.length);
       for (let i = 0; i < trims; i++) {
         const amt = Math.max(minBaseByQuote(price), roundToStep(sizeBaseB[i] * S.trimInsidePct, S.qtyStep));
-        pushDesired('buy', bids[i], amt, `trimBid-${i}`);
+        const rawPx = price - (i + 1) * trimGapAbs;
+        const px = roundToStep(rawPx, S.priceStep);
+        if (px > 0) pushDesired('buy', px, amt, `trimBid-${i}`);
       }
     }
 
@@ -624,6 +632,11 @@
 
     const observedBook = [];
 
+    const maxReplacesPerCycle = (Number.isFinite(orderPlan.maxReplacesPerCycle) && orderPlan.maxReplacesPerCycle > 0)
+      ? orderPlan.maxReplacesPerCycle
+      : Infinity;
+    let replacedThisCycle = 0;
+
     // Matcha/ersätt/avbryt befintliga ordrar
     for (const o of oo) {
       if (S.apiBackoffUntil > Date.now()) break;
@@ -640,6 +653,16 @@
       if (target) {
         const dist = Math.abs(rate - target.px);
         if (dist <= replaceTriggerAbs) { target.matched = true; continue; }
+        const tagKey = target.tag && target.tag.length ? target.tag : `${target.side}@${target.px.toFixed(6)}`;
+        const cooldownMs = Math.max(0, orderPlan.replaceCooldownMs || 0);
+        const lastReplace = S.replaceThrottle[tagKey] || 0;
+        const withinCooldown = cooldownMs > 0 && (now - lastReplace) < cooldownMs;
+        const limitReached = replacedThisCycle >= maxReplacesPerCycle;
+        if (withinCooldown || limitReached) {
+          target.matched = true;
+          continue;
+        }
+        S.replaceThrottle[tagKey] = now;
         handled = await replaceOne(o, target);
         if (orderPlan.placeSpacingMs > 0) await pause(orderPlan.placeSpacingMs);
         if (!handled) {
