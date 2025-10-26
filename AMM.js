@@ -63,31 +63,12 @@
     const legacyTrimCooldown = Number.isFinite(S.trimCooldownMs) ? S.trimCooldownMs : 15_000;
     orderPlan.trimCooldownMs = Math.max(0, legacyTrimCooldown);
   }
-  if (!Number.isFinite(orderPlan.maxReplacesPerCycle)) {
-    const legacyMaxReplace = Number.isFinite(S.maxReplacePerCycle)
-      ? S.maxReplacePerCycle
-      : Math.max(1, Math.floor(orderPlan.maxPerCycle / 2));
-    orderPlan.maxReplacesPerCycle = Math.max(0, legacyMaxReplace);
-  }
-  if (!Number.isFinite(orderPlan.replaceCooldownMs)) {
-    const legacyReplaceCooldown = Number.isFinite(S.replaceCooldownMs)
-      ? S.replaceCooldownMs
-      : Math.max(S.cooldownMs, 5_000);
-    orderPlan.replaceCooldownMs = Math.max(0, legacyReplaceCooldown);
-  }
-  if (!Number.isFinite(orderPlan.trimDistanceFactor)) {
-    const legacyTrimDistance = Number.isFinite(S.trimDistanceFactor) ? S.trimDistanceFactor : 0.35;
-    orderPlan.trimDistanceFactor = Math.max(0.05, Math.min(2, legacyTrimDistance));
-  }
   if (!Number.isFinite(S.trimInsidePct)) S.trimInsidePct = 0.15; // trims nära center, 15% av normal storlek
 
   // Spegla till legacy-fält för bakåtkompatibilitet i runtime-inställningar
   S.levelsPerSide = orderPlan.levels;
   S.trimLevels = orderPlan.trimLevels;
   S.maxActiveOrders = orderPlan.maxActive;
-  S.maxReplacePerCycle = orderPlan.maxReplacesPerCycle;
-  S.replaceCooldownMs = orderPlan.replaceCooldownMs;
-  S.trimDistanceFactor = orderPlan.trimDistanceFactor;
 
   // Tick/lot defaults (justera per instrument vid behov)
   if (typeof S.priceStep !== 'number') S.priceStep = 0.0001; // ex. DOGEUSDT typiskt 0.0001
@@ -499,14 +480,6 @@
       if (!Number.isFinite(trimThrottle[key]) || now - trimThrottle[key] > trimExpiry) delete trimThrottle[key];
     }
 
-    if (!S.replaceThrottle || typeof S.replaceThrottle !== 'object') S.replaceThrottle = {};
-    const replaceThrottle = S.replaceThrottle;
-    const replaceKeys = Object.keys(replaceThrottle);
-    const replaceExpiry = Math.max((orderPlan.replaceCooldownMs || 0) * 4, 120_000);
-    for (const key of replaceKeys) {
-      if (!Number.isFinite(replaceThrottle[key]) || now - replaceThrottle[key] > replaceExpiry) delete replaceThrottle[key];
-    }
-
     // helper: minsta basmängd som motsvarar minOrderQuote
     const minBaseByQuote = (qPx) => roundToStep(S.minOrderQuote / Math.max(1e-9, qPx), S.qtyStep);
 
@@ -691,7 +664,6 @@
         }
         S.replaceThrottle[tagKey] = now;
         handled = await replaceOne(o, target);
-        if (handled) replacedThisCycle++;
         if (orderPlan.placeSpacingMs > 0) await pause(orderPlan.placeSpacingMs);
         if (!handled) {
           if (S.apiBackoffUntil > Date.now()) break;
