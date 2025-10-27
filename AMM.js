@@ -41,6 +41,7 @@
   if (typeof S.minNotionalMultiplier !== 'number') S.minNotionalMultiplier = (1 + Math.max(0, S.minQuoteBumpPct || 0));
   if (typeof S.minNotionalBumpUSDT !== 'number') S.minNotionalBumpUSDT = 0.0;
   if (typeof S.absoluteMinQuoteUSDT !== 'number') S.absoluteMinQuoteUSDT = 0.0;
+  if (typeof S.minNotionalFallbackUSDT !== 'number') S.minNotionalFallbackUSDT = 5.0;
 
   // Per-symbol overrides lagras i S.perSymbol["LINKUSDT"] = { minNotionalMultiplier, minNotionalBumpUSDT, absoluteMinQuoteUSDT, minNotionalOverride, minQtyOverride }
   if (!S.perSymbol || typeof S.perSymbol !== 'object') S.perSymbol = {};
@@ -94,11 +95,42 @@
     console.log('[GRID] startvakt aktiv. hasTickStep=', hasTickStep, 'priceOk=', priceOk0);
     return;
   }
+  var fallbackTick = marketTick > 0 ? marketTick : 0.001;
+  var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
+
   if (!hasTickStep) {
     gb.data.pairLedger.notifications = [{ text: 'Tick/qtyStep saknas. Använder fallback 0.001/0.1', variant: 'info', persist: false }];
-    if (!(marketTick > 0)) marketTick = 0.001;
-    if (!(marketQtyStep > 0)) marketQtyStep = 0.1;
-    console.log('[GRID] startvakt: fallback tick=0.001 qtyStep=0.1');
+  }
+
+  if (!(marketTick > 0)) marketTick = fallbackTick;
+  if (!(marketQtyStep > 0)) marketQtyStep = fallbackQtyStep;
+
+  var minQtyFallback = Math.max(marketQtyStep > 0 ? marketQtyStep : 0, fallbackQtyStep, marketMinQty > 0 ? marketMinQty : 0);
+  if (!(marketMinQty > 0) || marketMinQty < minQtyFallback) marketMinQty = minQtyFallback;
+
+  if (price > 0 && marketMinQty > 0) {
+    var impliedMinNotQty = price * marketMinQty;
+    if (!(marketMinNot > 0) || marketMinNot < impliedMinNotQty) marketMinNot = impliedMinNotQty;
+  }
+  if (price > 0 && marketQtyStep > 0) {
+    var impliedMinNotStep = price * marketQtyStep;
+    if (!(marketMinNot > 0) || marketMinNot < impliedMinNotStep) marketMinNot = impliedMinNotStep;
+  }
+
+  var fallbackMinQuoteDefault = (Number.isFinite(S.minNotionalFallbackUSDT) && S.minNotionalFallbackUSDT > 0) ? S.minNotionalFallbackUSDT : 5;
+  var fallbackNeed = (!(marketMinNot > 0)) || (!hasTickStep && marketMinNot < fallbackMinQuoteDefault);
+  if (fallbackNeed) {
+    var fallbackMinNot = Math.max(
+      (price > 0 && marketMinQty > 0) ? price * marketMinQty : 0,
+      (price > 0 && marketQtyStep > 0) ? price * marketQtyStep : 0,
+      fallbackMinQuoteDefault,
+      Number(S.absoluteMinQuoteUSDT) || 0
+    );
+    if (!(marketMinNot > 0) || marketMinNot < fallbackMinNot) marketMinNot = fallbackMinNot;
+  }
+
+  if (!hasTickStep) {
+    console.log('[GRID] startvakt: fallback tick=' + marketTick + ' qtyStep=' + marketQtyStep + ' minQty=' + marketMinQty + ' minNot=' + marketMinNot);
   }
 
   // Spara effektiva steg
@@ -106,8 +138,6 @@
   if (typeof S.qtyStep   !== 'number' || S.qtyStep   <= 0) S.qtyStep   = marketQtyStep || 0.1;
 
   // För debug i UI
-  S._exMinQty   = marketMinQty;
-  S._exMinNot   = marketMinNot;
   S._exTick     = marketTick;
   S._exQtyStep  = marketQtyStep;
 
@@ -268,6 +298,8 @@
   S.dynamicMinQuote = minNotEff;
   S._minQtyEff = minQtyEff;
   S._minNotEff = minNotEff;
+  S._exMinQty = minQtyEff;
+  S._exMinNot = minNotEff;
 
   // ====== Auto-shed om över cap ======
   async function maybeAutoShed() {
