@@ -82,7 +82,9 @@
 
   var bid = Number.isFinite(gb.data.bid) ? gb.data.bid : (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.bid)) || 0;
   var ask = Number.isFinite(gb.data.ask) ? gb.data.ask : (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.ask)) || 0;
-  var price = (bid > 0 && ask > 0) ? (bid + ask) / 2 : (Math.max(bid, ask) || (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.last)) || 0);
+  var price = (bid > 0 && ask > 0)
+    ? (bid + ask) / 2
+    : (Math.max(bid, ask) || (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.last)) || 0);
   var priceOk0 = price > 0;
 
   // ====== INJEKTERAD FIX: robust extraktion av tick/step/minNot per symbol ======
@@ -164,13 +166,13 @@
   var ex = gb.data.exchangeName || '';
 
   function symbolKey() {
-    // "USDT-LINK-LONG" -> "LINKUSDT"
     var p = (gb && gb.data && (gb.data.pairName || gb.data.pair)) ? (gb.data.pairName || gb.data.pair) : '';
-    var parts = String(p).split('-'); // [quote, base, long|short]
+    var parts = String(p).split('-');
     var quote = (parts[0] || '').toUpperCase();
     var base  = (parts[1] || '').toUpperCase();
     return (base && quote) ? (base + quote) : '';
   }
+
 
   var wallet = Number.isFinite(gb.data.walletBalance) ? gb.data.walletBalance : 0;
   var qty = Number.isFinite(gb.data.currentQty) ? gb.data.currentQty : 0;
@@ -202,6 +204,12 @@
   }
   function fixPrice(px) { return preciseRoundToStep(px, S.priceStep); }
   function toQuote(px, base) { return Math.max(0, (Number.isFinite(px)?px:0) * (Number.isFinite(base)?base:0)); }
+  function hasMethod(name) { return !!(gb && gb.method && typeof gb.method[name] === 'function'); }
+  function callMethod(name, args) {
+    if (!hasMethod(name)) return null;
+    var ctx = (gb && typeof gb === 'object') ? gb : gb.method;
+    return gb.method[name].apply(ctx, Array.isArray(args) ? args : []);
+  }
   function pause(ms) { return new Promise(r => setTimeout(r, Math.max(0, ms))); }
   function safePromise(fn) { try { return Promise.resolve(fn()); } catch (err) { return Promise.reject(err); } }
   async function callWithTimeout(promise, ms, label) {
@@ -301,14 +309,6 @@
   // ====== Dynamiska min-nivåer (auto + per symbol + override) ======
   var qtyStep = S.qtyStep > 0 ? S.qtyStep : 0.1;
 
-  function symbolKey() {
-    var p = (gb && gb.data && (gb.data.pairName || gb.data.pair)) ? (gb.data.pairName || gb.data.pair) : '';
-    var parts = String(p).split('-');
-    var quote = (parts[0] || '').toUpperCase();
-    var base  = (parts[1] || '').toUpperCase();
-    return (base && quote) ? (base + quote) : '';
-  }
-
   var skey = symbolKey();
   var perSym = (S.perSymbol && S.perSymbol[skey]) ? S.perSymbol[skey] : null;
 
@@ -357,21 +357,20 @@
     var side = (qty > 0) ? 'sell' : 'buy';
     var pxIoc = (qty > 0) ? Math.max(bid, price * 0.999) : Math.min(ask, price * 1.001);
 
-    function hasMethod(n){ return gb && gb.method && typeof gb.method[n] === 'function'; }
     function placeIOC(side, q, px, reduceOnly) {
       if (reduceOnly) {
         if (side === 'buy') {
-          if (hasMethod('buyMarketReduceOnly')) return gb.method.buyMarketReduceOnly(q, pair, ex);
-          if (hasMethod('buyIOC'))              return gb.method.buyIOC(q, px, pair, ex, { reduceOnly: true });
-          return gb.method.buyMarket(q, pair, ex, { reduceOnly: true });
+          if (hasMethod('buyMarketReduceOnly')) return callMethod('buyMarketReduceOnly', [q, pair, ex]);
+          if (hasMethod('buyIOC'))              return callMethod('buyIOC', [q, px, pair, ex, { reduceOnly: true }]);
+          return callMethod('buyMarket', [q, pair, ex, { reduceOnly: true }]);
         } else {
-          if (hasMethod('sellMarketReduceOnly'))return gb.method.sellMarketReduceOnly(q, pair, ex);
-          if (hasMethod('sellIOC'))             return gb.method.sellIOC(q, px, pair, ex, { reduceOnly: true });
-          return gb.method.sellMarket(q, pair, ex, { reduceOnly: true });
+          if (hasMethod('sellMarketReduceOnly'))return callMethod('sellMarketReduceOnly', [q, pair, ex]);
+          if (hasMethod('sellIOC'))             return callMethod('sellIOC', [q, px, pair, ex, { reduceOnly: true }]);
+          return callMethod('sellMarket', [q, pair, ex, { reduceOnly: true }]);
         }
       }
-      if (side === 'buy')  return hasMethod('buyMarket')  ? gb.method.buyMarket(q, pair, ex)  : gb.method.buyIOC(q, px, pair, ex);
-      return hasMethod('sellMarket') ? gb.method.sellMarket(q, pair, ex) : gb.method.sellIOC(q, px, pair, ex);
+      if (side === 'buy')  return hasMethod('buyMarket')  ? callMethod('buyMarket', [q, pair, ex])  : callMethod('buyIOC', [q, px, pair, ex]);
+      return hasMethod('sellMarket') ? callMethod('sellMarket', [q, pair, ex]) : callMethod('sellIOC', [q, px, pair, ex]);
     }
 
     try {
@@ -401,14 +400,11 @@
 
     var perLevelQuote = allocQuote * (weights[i - 1] / wSum);
     var baseAmt = perLevelQuote / Math.max(1e-9, (price > 0 ? price : 1));
-    if (!Number.isFinite(baseAmt) || baseAmt <= 0) continue; // hoppa denna nivå
-    if (baseAmt < minQtyEff) continue; // skydda mot låga nivåer
-
     // initial bump mot mid-minima (senare per-order mot faktisk px)
     var hardMidBase = dynamicMinBaseMid;
 
     if (!Number.isFinite(baseAmt) || baseAmt <= 0) baseAmt = 0;
-    baseAmt = Math.max(baseAmt, hardMidBase);
+    baseAmt = Math.max(baseAmt, hardMidBase, minQtyEff);
 
     // cap per order mot equity
     var eqForCap = (S.startEquity > 0 ? S.startEquity : equity());
@@ -629,23 +625,22 @@
       return best;
     }
 
-    function hasMethod(name){ return gb && gb.method && typeof gb.method[name] === 'function'; }
     function placeLimit(side, qtyL, pxL, reduceOnly, postOnly) {
       if (reduceOnly) {
         if (side === 'buy') {
-          if (hasMethod('buyLimitReduceOnly'))  return gb.method.buyLimitReduceOnly(qtyL, pxL, pair, ex);
-          if (hasMethod('buyLimit'))            return gb.method.buyLimit(qtyL, pxL, pair, ex, { reduceOnly: true });
+          if (hasMethod('buyLimitReduceOnly'))  return callMethod('buyLimitReduceOnly', [qtyL, pxL, pair, ex]);
+          if (hasMethod('buyLimit'))            return callMethod('buyLimit', [qtyL, pxL, pair, ex, { reduceOnly: true }]);
         } else {
-          if (hasMethod('sellLimitReduceOnly')) return gb.method.sellLimitReduceOnly(qtyL, pxL, pair, ex);
-          if (hasMethod('sellLimit'))           return gb.method.sellLimit(qtyL, pxL, pair, ex, { reduceOnly: true });
+          if (hasMethod('sellLimitReduceOnly')) return callMethod('sellLimitReduceOnly', [qtyL, pxL, pair, ex]);
+          if (hasMethod('sellLimit'))           return callMethod('sellLimit', [qtyL, pxL, pair, ex, { reduceOnly: true }]);
         }
       }
       if (postOnly || S.usePostOnly) {
-        if (side === 'buy' && hasMethod('buyLimitPostOnly'))  return gb.method.buyLimitPostOnly(qtyL, pxL, pair, ex);
-        if (side === 'sell'&& hasMethod('sellLimitPostOnly')) return gb.method.sellLimitPostOnly(qtyL, pxL, pair, ex);
+        if (side === 'buy' && hasMethod('buyLimitPostOnly'))  return callMethod('buyLimitPostOnly', [qtyL, pxL, pair, ex]);
+        if (side === 'sell'&& hasMethod('sellLimitPostOnly')) return callMethod('sellLimitPostOnly', [qtyL, pxL, pair, ex]);
       }
-      if (side === 'buy')  return gb.method.buyLimit(qtyL, pxL, pair, ex);
-      return gb.method.sellLimit(qtyL, pxL, pair, ex);
+      if (side === 'buy')  return callMethod('buyLimit', [qtyL, pxL, pair, ex]);
+      return callMethod('sellLimit', [qtyL, pxL, pair, ex]);
     }
 
     async function placeOne(side, px, amt, tag) {
@@ -668,13 +663,13 @@
               var pxIoc = (qty > 0) ? Math.max(bid, price * 0.999) : Math.min(ask, price * 1.001);
               var resRO = await callWithTimeout(safePromise(function(){
                 if (qty > 0) {
-                  if (hasMethod('sellMarketReduceOnly')) return gb.method.sellMarketReduceOnly(posAbs, pair, ex);
-                  if (hasMethod('sellIOC'))             return gb.method.sellIOC(posAbs, fixPrice(pxIoc), pair, ex, { reduceOnly: true });
-                  return gb.method.sellMarket(posAbs, pair, ex, { reduceOnly: true });
+                  if (hasMethod('sellMarketReduceOnly')) return callMethod('sellMarketReduceOnly', [posAbs, pair, ex]);
+                  if (hasMethod('sellIOC'))             return callMethod('sellIOC', [posAbs, fixPrice(pxIoc), pair, ex, { reduceOnly: true }]);
+                  return callMethod('sellMarket', [posAbs, pair, ex, { reduceOnly: true }]);
                 } else {
-                  if (hasMethod('buyMarketReduceOnly')) return gb.method.buyMarketReduceOnly(posAbs, pair, ex);
-                  if (hasMethod('buyIOC'))              return gb.method.buyIOC(posAbs, fixPrice(pxIoc), pair, ex, { reduceOnly: true });
-                  return gb.method.buyMarket(posAbs, pair, ex, { reduceOnly: true });
+                  if (hasMethod('buyMarketReduceOnly')) return callMethod('buyMarketReduceOnly', [posAbs, pair, ex]);
+                  if (hasMethod('buyIOC'))              return callMethod('buyIOC', [posAbs, fixPrice(pxIoc), pair, ex, { reduceOnly: true }]);
+                  return callMethod('buyMarket', [posAbs, pair, ex, { reduceOnly: true }]);
                 }
               }), Math.max(8_000, S.localOrderTimeoutMs), 'trim-RO-ioc');
               clearApiFailure();
@@ -774,8 +769,7 @@
       var qOk = preciseRoundToStep(q, qtyStep);
       var pxOk = fixPrice(target.px);
       try {
-        var method = gb.method[replaceMethodName];
-        await callWithTimeout(safePromise(function(){ return method(id, qOk, pxOk, pair, ex); }), S.localOrderTimeoutMs, 'replace order');
+        await callWithTimeout(safePromise(function(){ return callMethod(replaceMethodName, [id, qOk, pxOk, pair, ex]); }), S.localOrderTimeoutMs, 'replace order');
         clearApiFailure();
         target.matched = true; replacedThisCycle++;
         console.log('[GRID]', S.role, 'replaced', sideFromOrder(order), qOk, '@', pxOk);
@@ -791,7 +785,7 @@
       var id = typeof orderOrId === 'string' ? orderOrId : idFromOrder(orderOrId);
       if (!id) return false;
       try {
-        await callWithTimeout(safePromise(function(){ return gb.method.cancelOrder(id, pair, ex); }), S.localOrderTimeoutMs, 'cancel order');
+        await callWithTimeout(safePromise(function(){ return callMethod('cancelOrder', [id, pair, ex]); }), S.localOrderTimeoutMs, 'cancel order');
         clearApiFailure();
         return true;
       } catch (err) {
