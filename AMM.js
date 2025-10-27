@@ -162,8 +162,29 @@
 
   // ====== Utils ======
   var now = Date.now();
-  var pair = gb.data.pairName || gb.data.pair || '';
+  var pairRaw = gb.data.pairName || gb.data.pair || '';
   var ex = gb.data.exchangeName || '';
+
+  function normalizePairName(input) {
+    var src = (input && typeof input === 'string') ? input : '';
+    if (!src.length) {
+      var skey = symbolKey();
+      return skey && skey.length ? skey : src;
+    }
+    if (src.indexOf('-') >= 0) {
+      var parts = src.split('-');
+      if (parts.length >= 2) {
+        var quote = (parts[0] || '').toUpperCase();
+        var base = (parts[1] || '').toUpperCase();
+        if (base && quote) return base + quote;
+      }
+      return src.replace(/-/g, '');
+    }
+    return src;
+  }
+
+  var pairForMethod = normalizePairName(pairRaw);
+  var pairLabel = pairRaw || pairForMethod;
 
   function symbolKey() {
     var p = (gb && gb.data && (gb.data.pairName || gb.data.pair)) ? (gb.data.pairName || gb.data.pair) : '';
