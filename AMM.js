@@ -41,6 +41,7 @@
   if (typeof S.minNotionalMultiplier !== 'number') S.minNotionalMultiplier = (1 + Math.max(0, S.minQuoteBumpPct || 0));
   if (typeof S.minNotionalBumpUSDT !== 'number') S.minNotionalBumpUSDT = 0.0;
   if (typeof S.absoluteMinQuoteUSDT !== 'number') S.absoluteMinQuoteUSDT = 0.0;
+  if (typeof S.minNotionalFallbackUSDT !== 'number') S.minNotionalFallbackUSDT = 5.0;
 
   // Per-symbol overrides lagras i S.perSymbol["LINKUSDT"] = { minNotionalMultiplier, minNotionalBumpUSDT, absoluteMinQuoteUSDT, minNotionalOverride, minQtyOverride }
   if (!S.perSymbol || typeof S.perSymbol !== 'object') S.perSymbol = {};
@@ -94,6 +95,9 @@
     console.log('[GRID] startvakt aktiv. hasTickStep=', hasTickStep, 'priceOk=', priceOk0);
     return;
   }
+  var fallbackTick = marketTick > 0 ? marketTick : 0.001;
+  var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
+
   if (!hasTickStep) {
     var fallbackTick = marketTick > 0 ? marketTick : 0.001;
     var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
