@@ -207,9 +207,8 @@
   function hasMethod(name) { return !!(gb && gb.method && typeof gb.method[name] === 'function'); }
   function callMethod(name, args) {
     if (!hasMethod(name)) return null;
-    var fn = gb.method[name];
-    var ctx = (gb && gb.method && typeof gb.method === 'object') ? gb.method : gb;
-    return fn.apply(ctx, Array.isArray(args) ? args : []);
+    var ctx = (gb && typeof gb === 'object') ? gb : gb.method;
+    return gb.method[name].apply(ctx, Array.isArray(args) ? args : []);
   }
   function pause(ms) { return new Promise(r => setTimeout(r, Math.max(0, ms))); }
   function safePromise(fn) { try { return Promise.resolve(fn()); } catch (err) { return Promise.reject(err); } }
