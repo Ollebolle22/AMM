@@ -142,11 +142,28 @@
   var breakEven = Number.isFinite(gb.data.breakEven) ? gb.data.breakEven : 0;
   var liq = Number.isFinite(gb.data.liquidationPrice) ? gb.data.liquidationPrice : 0;
 
+  function stepPrecision(step) {
+    return Math.max(0, Math.round(Math.log10(1 / step)));
+  }
   function preciseRoundToStep(v, step) {
     if (!Number.isFinite(v)) return 0;
     if (!Number.isFinite(step) || step <= 0) return v;
-    var k = Math.max(0, Math.round(Math.log10(1 / step)));
+    var k = stepPrecision(step);
     return Number((Math.round(v / step) * step).toFixed(k));
+  }
+  function preciseCeilToStep(v, step) {
+    if (!Number.isFinite(v)) return 0;
+    if (!Number.isFinite(step) || step <= 0) return v;
+    var k = stepPrecision(step);
+    var scaled = Math.ceil(v / step - 1e-12);
+    return Number((scaled * step).toFixed(k));
+  }
+  function preciseFloorToStep(v, step) {
+    if (!Number.isFinite(v)) return 0;
+    if (!Number.isFinite(step) || step <= 0) return v;
+    var k = stepPrecision(step);
+    var scaled = Math.floor(v / step + 1e-12);
+    return Number((scaled * step).toFixed(k));
   }
   function fixPrice(px) { return preciseRoundToStep(px, S.priceStep); }
   function toQuote(px, base) { return Math.max(0, (Number.isFinite(px)?px:0) * (Number.isFinite(base)?base:0)); }
@@ -274,7 +291,7 @@
   var minNotEff = Math.max(baseMinNot0 * multPerSym + bumpUSDT, absMinUSDT);
 
   var minBaseByNotionalMid = (minNotEff > 0 && price > 0) ? (minNotEff / price) : 0;
-  var dynamicMinBaseMid = preciseRoundToStep(Math.max(minQtyEff || 0, minBaseByNotionalMid || 0, S.minBaseAmt || 0), qtyStep);
+  var dynamicMinBaseMid = preciseCeilToStep(Math.max(minQtyEff || 0, minBaseByNotionalMid || 0, S.minBaseAmt || 0), qtyStep);
 
   S.dynamicMinBase = dynamicMinBaseMid;
   S.dynamicMinQuote = minNotEff;
@@ -517,7 +534,7 @@
       var trimsL = Math.min(S.trimLevels, asks.length);
       for (var ti=0; ti<trimsL; ti++) {
         var base0 = preciseRoundToStep(sizeBaseA[ti] * (S.trimInsidePct || 0.25), qtyStep);
-        var amtTrim = Math.max(dynamicMinBaseMid, base0);
+        var amtTrim = preciseCeilToStep(Math.max(dynamicMinBaseMid, base0), qtyStep);
         if (S.reduceOnlyTrims) amtTrim = Math.min(amtTrim, Math.max(0, Math.abs(qty)));
         var pxT = fixPrice(price + (ti + 1) * trimGapAbs);
         if (pxT > 0 && amtTrim > 0) pushDesired('sell', pxT, amtTrim, 'trimAsk-' + ti + '|RO');
@@ -527,7 +544,7 @@
       var trimsS = Math.min(S.trimLevels, bids.length);
       for (var tj=0; tj<trimsS; tj++) {
         var base0s = preciseRoundToStep(sizeBaseB[tj] * (S.trimInsidePct || 0.25), qtyStep);
-        var amtTrimS = Math.max(dynamicMinBaseMid, base0s);
+        var amtTrimS = preciseCeilToStep(Math.max(dynamicMinBaseMid, base0s), qtyStep);
         if (S.reduceOnlyTrims) amtTrimS = Math.min(amtTrimS, Math.max(0, Math.abs(qty)));
         var pxTs = fixPrice(price - (tj + 1) * trimGapAbs);
         if (pxTs > 0 && amtTrimS > 0) pushDesired('buy', pxTs, amtTrimS, 'trimBid-' + tj + '|RO');
@@ -598,7 +615,7 @@
 
         if (reduceOnly) {
           var posAbs = Math.max(0, Math.abs(qty));
-          amtOk = Math.min(Math.max(0, Number(amt) || 0), posAbs);
+          amtOk = preciseFloorToStep(Math.min(Math.max(0, Number(amt) || 0), posAbs), qtyStep);
           var belowMinQtyRO = (minQtyEff > 0 && amtOk < minQtyEff);
           var belowMinNotRO = (minNotEff > 0 && toQuote(price, amtOk) < minNotEff);
           if (amtOk <= 0 || belowMinQtyRO || belowMinNotRO) {
@@ -631,16 +648,16 @@
         } else {
           // Vanlig gridorder: hårda MIN per ORDER-PRIS
           var needQuoteBase = (minNotEff > 0 && pxOk > 0) ? (minNotEff / pxOk) : 0;
-          var hardMinBaseNow = preciseRoundToStep(Math.max(S.minBaseAmt || 0, minQtyEff || 0, needQuoteBase || 0), qtyStep);
+          var hardMinBaseNow = preciseCeilToStep(Math.max(S.minBaseAmt || 0, minQtyEff || 0, needQuoteBase || 0), qtyStep);
           var baseCandidate = Number(amt) || 0;
           if (!Number.isFinite(baseCandidate) || baseCandidate <= 0) baseCandidate = 0;
           // ta max(baseCandidate, hardMinBaseNow)
-          amtOk = preciseRoundToStep(Math.max(baseCandidate, hardMinBaseNow), qtyStep);
+          amtOk = preciseCeilToStep(Math.max(baseCandidate, hardMinBaseNow), qtyStep);
 
           // bump om notional blir exakt på gräns
           var qv = toQuote(pxOk, amtOk);
           if (minNotEff > 0 && qv < minNotEff) {
-            var bumpBase = preciseRoundToStep((minNotEff / pxOk) * 1.001, qtyStep);
+            var bumpBase = preciseCeilToStep((minNotEff / pxOk) * 1.001, qtyStep);
             amtOk = Math.max(amtOk, bumpBase);
             qv = toQuote(pxOk, amtOk);
           }
@@ -649,7 +666,7 @@
           var eqForCap2 = (S.startEquity > 0 ? S.startEquity : equity());
           var maxQuote2 = Math.max(0, eqForCap2 * (Number.isFinite(S.maxOrderQuotePct)?S.maxOrderQuotePct:0.01));
           if (maxQuote2 > 0 && qv > maxQuote2) {
-            amtOk = preciseRoundToStep(maxQuote2 / Math.max(1e-9, pxOk), qtyStep);
+            amtOk = preciseFloorToStep(maxQuote2 / Math.max(1e-9, pxOk), qtyStep);
             qv = toQuote(pxOk, amtOk);
           }
 
