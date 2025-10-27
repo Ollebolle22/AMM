@@ -42,7 +42,6 @@
   if (typeof S.minNotionalBumpUSDT !== 'number') S.minNotionalBumpUSDT = 0.0;
   if (typeof S.absoluteMinQuoteUSDT !== 'number') S.absoluteMinQuoteUSDT = 0.0;
   if (typeof S.minNotionalFallbackUSDT !== 'number') S.minNotionalFallbackUSDT = 5.0;
-  if (typeof S.minQtyFallbackBase !== 'number') S.minQtyFallbackBase = 1.0;
 
   // Per-symbol overrides lagras i S.perSymbol["LINKUSDT"] = { minNotionalMultiplier, minNotionalBumpUSDT, absoluteMinQuoteUSDT, minNotionalOverride, minQtyOverride }
   if (!S.perSymbol || typeof S.perSymbol !== 'object') S.perSymbol = {};
@@ -98,37 +97,21 @@
   }
   var fallbackTick = marketTick > 0 ? marketTick : 0.001;
   var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
-  var fallbackMinQtyDefault = (Number.isFinite(S.minQtyFallbackBase) && S.minQtyFallbackBase > 0) ? S.minQtyFallbackBase : 1;
 
   if (!hasTickStep) {
+    var fallbackTick = marketTick > 0 ? marketTick : 0.001;
+    var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
     gb.data.pairLedger.notifications = [{ text: 'Tick/qtyStep saknas. Använder fallback 0.001/0.1', variant: 'info', persist: false }];
-  }
+    if (!(marketTick > 0)) marketTick = fallbackTick;
+    if (!(marketQtyStep > 0)) marketQtyStep = fallbackQtyStep;
 
-  var effectiveTick = (marketTick > 0) ? marketTick : fallbackTick;
-  var effectiveQtyStep = (marketQtyStep > 0) ? marketQtyStep : fallbackQtyStep;
-  var effectiveMinQty = (marketMinQty > 0) ? marketMinQty : 0;
+    var minQtyFallback = Math.max(fallbackQtyStep, marketMinQty > 0 ? marketMinQty : 0);
+    if (!(marketMinQty > 0) || marketMinQty < minQtyFallback) marketMinQty = minQtyFallback;
 
-  effectiveMinQty = Math.max(effectiveMinQty, effectiveQtyStep);
-  if (!hasTickStep || !(effectiveMinQty > 0)) {
-    effectiveMinQty = Math.max(effectiveMinQty, fallbackQtyStep, fallbackMinQtyDefault);
-  }
+    if (!(marketMinNot > 0) && price > 0 && marketMinQty > 0) {
+      marketMinNot = price * marketMinQty;
+    }
 
-  var effectiveMinNot = (marketMinNot > 0) ? marketMinNot : 0;
-  if (price > 0 && effectiveMinQty > 0) effectiveMinNot = Math.max(effectiveMinNot, price * effectiveMinQty);
-  if (price > 0 && effectiveQtyStep > 0) effectiveMinNot = Math.max(effectiveMinNot, price * effectiveQtyStep);
-
-  var fallbackMinQuoteDefault = (Number.isFinite(S.minNotionalFallbackUSDT) && S.minNotionalFallbackUSDT > 0) ? S.minNotionalFallbackUSDT : 5;
-  var absoluteMinQuote = Math.max(0, Number(S.absoluteMinQuoteUSDT) || 0);
-  if (!hasTickStep || !(marketMinNot > 0)) {
-    effectiveMinNot = Math.max(effectiveMinNot, fallbackMinQuoteDefault, absoluteMinQuote);
-  }
-
-  marketTick = effectiveTick;
-  marketQtyStep = effectiveQtyStep;
-  marketMinQty = effectiveMinQty;
-  marketMinNot = effectiveMinNot;
-
-  if (!hasTickStep) {
     console.log('[GRID] startvakt: fallback tick=' + marketTick + ' qtyStep=' + marketQtyStep + ' minQty=' + marketMinQty + ' minNot=' + marketMinNot);
   }
 
