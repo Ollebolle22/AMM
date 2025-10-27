@@ -99,37 +99,19 @@
   var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
 
   if (!hasTickStep) {
+    var fallbackTick = marketTick > 0 ? marketTick : 0.001;
+    var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
     gb.data.pairLedger.notifications = [{ text: 'Tick/qtyStep saknas. Använder fallback 0.001/0.1', variant: 'info', persist: false }];
-  }
+    if (!(marketTick > 0)) marketTick = fallbackTick;
+    if (!(marketQtyStep > 0)) marketQtyStep = fallbackQtyStep;
 
-  if (!(marketTick > 0)) marketTick = fallbackTick;
-  if (!(marketQtyStep > 0)) marketQtyStep = fallbackQtyStep;
+    var minQtyFallback = Math.max(fallbackQtyStep, marketMinQty > 0 ? marketMinQty : 0);
+    if (!(marketMinQty > 0) || marketMinQty < minQtyFallback) marketMinQty = minQtyFallback;
 
-  var minQtyFallback = Math.max(marketQtyStep > 0 ? marketQtyStep : 0, fallbackQtyStep, marketMinQty > 0 ? marketMinQty : 0);
-  if (!(marketMinQty > 0) || marketMinQty < minQtyFallback) marketMinQty = minQtyFallback;
+    if (!(marketMinNot > 0) && price > 0 && marketMinQty > 0) {
+      marketMinNot = price * marketMinQty;
+    }
 
-  if (price > 0 && marketMinQty > 0) {
-    var impliedMinNotQty = price * marketMinQty;
-    if (!(marketMinNot > 0) || marketMinNot < impliedMinNotQty) marketMinNot = impliedMinNotQty;
-  }
-  if (price > 0 && marketQtyStep > 0) {
-    var impliedMinNotStep = price * marketQtyStep;
-    if (!(marketMinNot > 0) || marketMinNot < impliedMinNotStep) marketMinNot = impliedMinNotStep;
-  }
-
-  var fallbackMinQuoteDefault = (Number.isFinite(S.minNotionalFallbackUSDT) && S.minNotionalFallbackUSDT > 0) ? S.minNotionalFallbackUSDT : 5;
-  var fallbackNeed = (!(marketMinNot > 0)) || (!hasTickStep && marketMinNot < fallbackMinQuoteDefault);
-  if (fallbackNeed) {
-    var fallbackMinNot = Math.max(
-      (price > 0 && marketMinQty > 0) ? price * marketMinQty : 0,
-      (price > 0 && marketQtyStep > 0) ? price * marketQtyStep : 0,
-      fallbackMinQuoteDefault,
-      Number(S.absoluteMinQuoteUSDT) || 0
-    );
-    if (!(marketMinNot > 0) || marketMinNot < fallbackMinNot) marketMinNot = fallbackMinNot;
-  }
-
-  if (!hasTickStep) {
     console.log('[GRID] startvakt: fallback tick=' + marketTick + ' qtyStep=' + marketQtyStep + ' minQty=' + marketMinQty + ' minNot=' + marketMinNot);
   }
 
