@@ -207,34 +207,8 @@
   function hasMethod(name) { return !!(gb && gb.method && typeof gb.method[name] === 'function'); }
   function callMethod(name, args) {
     if (!hasMethod(name)) return null;
-    var callArgs = Array.isArray(args) ? args : [];
-    var fn = gb.method[name];
-
-    var fallbacks = [];
-    if (gb && gb.method) {
-      fallbacks.push(gb.method);
-      if (gb.method.ctx) fallbacks.push(gb.method.ctx);
-      if (gb.method.ctxWrapper) fallbacks.push(gb.method.ctxWrapper);
-    }
-    if (gb && gb.ctxWrapper) fallbacks.push(gb.ctxWrapper);
-    if (gb) fallbacks.push(gb);
-    fallbacks.push(null);
-
-    var lastErr = null;
-    for (var i = 0; i < fallbacks.length; i++) {
-      var ctx = fallbacks[i];
-      try {
-        return fn.apply(ctx, callArgs);
-      } catch (err) {
-        lastErr = err;
-        var msg = err && err.message ? String(err.message).toLowerCase() : '';
-        var isCtxErr = msg.indexOf('whatstrat') >= 0 || msg.indexOf('ctx') >= 0 || msg.indexOf('bid') >= 0;
-        if (!isCtxErr || i === fallbacks.length - 1) throw err;
-      }
-    }
-
-    if (lastErr) throw lastErr;
-    return null;
+    var ctx = (gb && typeof gb === 'object') ? gb : gb.method;
+    return gb.method[name].apply(ctx, Array.isArray(args) ? args : []);
   }
   function pause(ms) { return new Promise(r => setTimeout(r, Math.max(0, ms))); }
   function safePromise(fn) { try { return Promise.resolve(fn()); } catch (err) { return Promise.reject(err); } }
