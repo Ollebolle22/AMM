@@ -73,18 +73,54 @@
   S.trimLevels = orderPlan.trimLevels;
   S.maxActiveOrders = orderPlan.maxActive;
 
-  // ====== Marknad ======
+  // ====== Marknad (grunder) ======
   var m = (gb && gb.data && gb.data.market) ? gb.data.market : {};
   var marketTick    = Number(m && m.priceFilter && m.priceFilter.tickSize ? m.priceFilter.tickSize : 0);
   var marketQtyStep = Number(m && m.lotSizeFilter && m.lotSizeFilter.qtyStep ? m.lotSizeFilter.qtyStep : 0);
   var marketMinQty  = Number(m && m.lotSizeFilter && m.lotSizeFilter.minOrderQty ? m.lotSizeFilter.minOrderQty : 0);
   var marketMinNot  = Number(m && m.lotSizeFilter && m.lotSizeFilter.minNotionalValue ? m.lotSizeFilter.minNotionalValue : 0);
 
-  var bid = Number.isFinite(gb.data.bid) ? gb.data.bid : 0;
-  var ask = Number.isFinite(gb.data.ask) ? gb.data.ask : 0;
-  var price = (bid > 0 && ask > 0) ? (bid + ask) / 2 : Math.max(bid, ask);
-  var hasTickStep = (marketTick > 0 && marketQtyStep > 0);
+  var bid = Number.isFinite(gb.data.bid) ? gb.data.bid : (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.bid)) || 0;
+  var ask = Number.isFinite(gb.data.ask) ? gb.data.ask : (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.ask)) || 0;
+  var price = (bid > 0 && ask > 0) ? (bid + ask) / 2 : (Math.max(bid, ask) || (gb && gb.data && gb.data.ticker && Number(gb.data.ticker.last)) || 0);
   var priceOk0 = price > 0;
+
+  // ====== INJEKTERAD FIX: robust extraktion av tick/step/minNot per symbol ======
+  function extractSymbolPrecision(symbolInfo, currentPrice) {
+    symbolInfo = symbolInfo && typeof symbolInfo === 'object' ? symbolInfo : {};
+    var lot = symbolInfo.lotSizeFilter && typeof symbolInfo.lotSizeFilter === 'object' ? symbolInfo.lotSizeFilter : {};
+    var priceFilter = symbolInfo.priceFilter && typeof symbolInfo.priceFilter === 'object' ? symbolInfo.priceFilter : {};
+
+    var tickSize = parseFloat(priceFilter.tickSize); if (!isFinite(tickSize) || tickSize <= 0) tickSize = 0.001;
+    var minQty   = parseFloat(lot.minOrderQty);      if (!isFinite(minQty)   || minQty   <= 0) minQty   = 0.1;
+    var qtyStep  = parseFloat(lot.qtyStep);          if (!isFinite(qtyStep)  || qtyStep  <= 0) qtyStep  = 0.1;
+    var minNotionalRaw = parseFloat(lot.minNotionalValue); if (!isFinite(minNotionalRaw) || minNotionalRaw < 0) minNotionalRaw = 0;
+
+    var cp = isFinite(currentPrice) && currentPrice > 0 ? currentPrice : 0;
+    var impliedMinNot = cp > 0 ? Number((cp * minQty).toFixed(6)) : 0;
+    // Bybit skydd: minst 5 USDT
+    var minNotEff = Math.max(minNotionalRaw, impliedMinNot, 5.0);
+
+    return { tickSize: tickSize, qtyStep: qtyStep, minQty: minQty, minNotEff: minNotEff };
+  }
+
+  // Använd extraktionen om möjligt
+  try {
+    var extracted = extractSymbolPrecision(m, price);
+    // Överskriv marknadsvärden med säkra
+    marketTick    = extracted.tickSize;
+    marketQtyStep = extracted.qtyStep;
+    marketMinQty  = extracted.minQty;
+    // Behåll det högsta av börsens minNotional och vår säkra
+    marketMinNot  = Math.max(Number(marketMinNot || 0), Number(extracted.minNotEff || 0));
+    console.log('[GRID] extractSymbolPrecision:', extracted);
+  } catch (e) {
+    console.log('[GRID] extractSymbolPrecision failed – använder rå marknadsvärden.', e && e.message ? e.message : e);
+  }
+  // ================================================================
+
+  // Nu kan vi tryggt kolla hasTickStep med våra (ev. uppdaterade) värden:
+  var hasTickStep = (marketTick > 0 && marketQtyStep > 0);
 
   // Startvakt: kräv bara pris; tick/step får fallback
   if (!priceOk0) {
@@ -95,12 +131,11 @@
     console.log('[GRID] startvakt aktiv. hasTickStep=', hasTickStep, 'priceOk=', priceOk0);
     return;
   }
+
   var fallbackTick = marketTick > 0 ? marketTick : 0.001;
   var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
 
   if (!hasTickStep) {
-    var fallbackTick = marketTick > 0 ? marketTick : 0.001;
-    var fallbackQtyStep = marketQtyStep > 0 ? marketQtyStep : 0.1;
     gb.data.pairLedger.notifications = [{ text: 'Tick/qtyStep saknas. Använder fallback 0.001/0.1', variant: 'info', persist: false }];
     if (!(marketTick > 0)) marketTick = fallbackTick;
     if (!(marketQtyStep > 0)) marketQtyStep = fallbackQtyStep;
@@ -266,6 +301,14 @@
   // ====== Dynamiska min-nivåer (auto + per symbol + override) ======
   var qtyStep = S.qtyStep > 0 ? S.qtyStep : 0.1;
 
+  function symbolKey() {
+    var p = (gb && gb.data && (gb.data.pairName || gb.data.pair)) ? (gb.data.pairName || gb.data.pair) : '';
+    var parts = String(p).split('-');
+    var quote = (parts[0] || '').toUpperCase();
+    var base  = (parts[1] || '').toUpperCase();
+    return (base && quote) ? (base + quote) : '';
+  }
+
   var skey = symbolKey();
   var perSym = (S.perSymbol && S.perSymbol[skey]) ? S.perSymbol[skey] : null;
 
@@ -358,6 +401,8 @@
 
     var perLevelQuote = allocQuote * (weights[i - 1] / wSum);
     var baseAmt = perLevelQuote / Math.max(1e-9, (price > 0 ? price : 1));
+    if (!Number.isFinite(baseAmt) || baseAmt <= 0) continue; // hoppa denna nivå
+    if (baseAmt < minQtyEff) continue; // skydda mot låga nivåer
 
     // initial bump mot mid-minima (senare per-order mot faktisk px)
     var hardMidBase = dynamicMinBaseMid;
@@ -672,9 +717,10 @@
 
           // sista kontroll
           var failReason = null;
-          if (minQtyEff > 0 && amtOk < minQtyEff) failReason = 'under minQtyEff';
-          if (!failReason && minNotEff > 0 && qv < minNotEff) failReason = 'under minNotEff';
           if (amtOk <= 0) failReason = 'amt<=0';
+          else if (minQtyEff > 0 && amtOk < minQtyEff) failReason = 'under minQtyEff';
+          else if (minNotEff > 0 && qv < minNotEff) failReason = 'under minNotEff';
+
           if (failReason) {
             console.log('[GRID] skip grid order: fail=' + failReason, { pxOk: pxOk, amtOk: amtOk, qv: qv, minQtyEff: minQtyEff, minNotEff: minNotEff });
             return false;
@@ -701,7 +747,6 @@
         if (!ok) {
           var errMsg = (res && (res.retMsg || res.msg || res.message)) ? (res.retMsg || res.msg || res.message) : null;
           console.log('[GRID] place returned error-ish response', side, pxOk, { amtOk: amtOk, minQtyEff: minQtyEff, minNotEff: minNotEff }, errMsg ? 'err=' + errMsg : '', '\nresp=', res);
-          // Bybit kan svara "The number of contracts exceeds minimum limit allowed" även när qty < min.
           if (errMsg && shouldBackoff({ message: errMsg })) markApiFailure({ message: errMsg });
           return false;
         }
