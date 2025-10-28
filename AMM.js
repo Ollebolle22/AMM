@@ -1070,9 +1070,12 @@
     }
     if (!blockReasons.length) blockReasons.push('ingen trigger ännu');
     var blockKey = blockReasons.join('|');
-    console.log('[GRID]', S.role, 'ingen ordercykel nu –', blockReasons.join('; '));
-    S._lastBlockKey = blockKey;
-    S._lastBlockTs = now2;
+    var shouldLogBlock = (!S._lastBlockKey || S._lastBlockKey !== blockKey || (now2 - (S._lastBlockTs || 0)) > Math.max(15_000, S.cooldownMs || 0));
+    if (shouldLogBlock) {
+      console.log('[GRID]', S.role, 'ingen ordercykel nu –', blockReasons.join('; '));
+      S._lastBlockKey = blockKey;
+      S._lastBlockTs = now2;
+    }
   }
 
   // ====== Metrics/Sidebar/Lines ======
