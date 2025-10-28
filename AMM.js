@@ -684,13 +684,14 @@
   }
 
   // ====== Orderläggning ======
+  var desired = null;
   if (cycleDue && !S.paused && !apiUnstable) {
     if (!S.trimThrottle || typeof S.trimThrottle !== 'object') S.trimThrottle = {};
     var trimThrottle = S.trimThrottle;
     var trimExpiry = Math.max(orderPlan.trimCooldownMs * 4, 120_000);
     for (var key in trimThrottle) if (!Number.isFinite(trimThrottle[key]) || now2 - trimThrottle[key] > trimExpiry) delete trimThrottle[key];
 
-    var desired = [];
+    desired = [];
     function pushDesired(side, px, amt, tag) {
       if (!Number.isFinite(px) || px <= 0) return;
       if (!Number.isFinite(amt) || amt <= 0) return;
@@ -730,6 +731,10 @@
       'minQtyEff=' + minQtyEff, 'minNotEff=' + minNotEff,
       'dynMinBase=' + dynamicMinBaseMid
     );
+
+    if (desired.length === 0) {
+      console.log('[GRID]', S.role, 'inga planerade order i denna cykel – alla nivåer uppfyllda eller budget=0');
+    }
 
     var replaceMethodName =
       (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder' :
@@ -1000,7 +1005,11 @@
       if (!hit) coalesce.push(d2);
     }
     missing = coalesce;
-    if (missing.length) console.log('[GRID]', S.role, 'saknar', missing.length, 'mål -> försöker lägga');
+    if (missing.length) {
+      console.log('[GRID]', S.role, 'saknar', missing.length, 'mål -> försöker lägga');
+    } else {
+      console.log('[GRID]', S.role, 'inga nya order behövs – alla', desired.length, 'mål matchade av befintliga order');
+    }
 
     var eqNow2 = equity();
     var qtyCap = (S.invMaxPct * Math.max(1e-9, eqNow2)) / Math.max(1e-9, price);
@@ -1025,13 +1034,48 @@
       if (S.apiBackoffUntil > Date.now()) break;
     }
 
-    if (added > 0) gb.data.pairLedger.notifications = [{ text: 'Rutnät ' + S.role.toUpperCase() + ': +' + added + ' nya order', variant: 'info', persist: false }];
-    else if (missing.length > 0) console.log('[GRID]', S.role, 'kunde inte lägga om saknade order denna cykel');
+    if (added > 0) {
+      gb.data.pairLedger.notifications = [{ text: 'Rutnät ' + S.role.toUpperCase() + ': +' + added + ' nya order', variant: 'info', persist: false }];
+    } else if (missing.length > 0) {
+      console.log('[GRID]', S.role, 'kunde inte lägga om saknade order denna cykel');
+    } else {
+      console.log('[GRID]', S.role, 'cykel klar utan nya order – alla mål redan täckta');
+    }
 
     S.lastDesiredShape = desired.map(function(d){ return { side: d.side, px: d.px }; });
     S.lastCycleTs = now2; S.forceImmediateCycle = false;
   } else if (cycleDue) {
-    console.log('[GRID]', S.role, 'hoppar cykel p.g.a.', S.paused ? ('paus (' + (S.lastPauseReason||'-') + ')') : 'API-backoff');
+    var cycleSkip = [];
+    if (S.paused) cycleSkip.push('paus (' + (S.lastPauseReason || '-') + ')');
+    if (apiUnstable) {
+      var remainBackoffNow = Math.max(0, (S.apiBackoffUntil || 0) - now2);
+      cycleSkip.push('API-backoff ' + Math.round(remainBackoffNow / 1000) + 's kvar');
+    }
+    if (!cycleSkip.length) cycleSkip.push('okänd orsak');
+    console.log('[GRID]', S.role, 'hoppar cykel –', cycleSkip.join('; '));
+  } else {
+    var blockReasons = [];
+    var sinceLast = (Number.isFinite(S.lastCycleTs) && S.lastCycleTs > 0) ? (now2 - S.lastCycleTs) : Infinity;
+    if (!cycleDueBase) {
+      var remainMs = Math.max(0, (S.cooldownMs || 0) - sinceLast);
+      blockReasons.push('cooldown ' + Math.round(remainMs / 1000) + 's kvar');
+    }
+    if (S.paused) blockReasons.push('paus (' + (S.lastPauseReason || '-') + ')');
+    if (apiUnstable) {
+      var remainBackoff = Math.max(0, (S.apiBackoffUntil || 0) - now2);
+      blockReasons.push('API-backoff ' + Math.round(remainBackoff / 1000) + 's kvar');
+    }
+    if (!cycleDueBase && Array.isArray(S.lastDesiredShape) && S.lastDesiredShape.length === 0) {
+      blockReasons.push('inga planerade nivåer just nu');
+    }
+    if (!blockReasons.length) blockReasons.push('ingen trigger ännu');
+    var blockKey = blockReasons.join('|');
+    var shouldLogBlock = (!S._lastBlockKey || S._lastBlockKey !== blockKey || (now2 - (S._lastBlockTs || 0)) > Math.max(15_000, S.cooldownMs || 0));
+    if (shouldLogBlock) {
+      console.log('[GRID]', S.role, 'ingen ordercykel nu –', blockReasons.join('; '));
+      S._lastBlockKey = blockKey;
+      S._lastBlockTs = now2;
+    }
   }
 
   // ====== Metrics/Sidebar/Lines ======
