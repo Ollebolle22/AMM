@@ -204,7 +204,7 @@
   var pairLabel = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
   var pair = pairRaw && pairRaw.length ? pairRaw : pairForMethod;
   if (gb && gb.data && gb.data.pairLedger) {
-    gb.data.pairLedger.customPairLabel = pairLabel;
+    gb.data.pairLedger.customPairLabel = pairDisplay;
   }
 
   function symbolKey() {
