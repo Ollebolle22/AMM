@@ -183,8 +183,28 @@
     return src;
   }
 
+  function formatPairLabel(input, role) {
+    var txt = (typeof input === 'string' && input.length) ? input : '';
+    if (!txt.length) return txt;
+    var parts = txt.split('-').filter(function(p){ return p && p.length; });
+    if (!parts.length) return txt;
+    var roleUpper = (typeof role === 'string' ? role.toUpperCase() : '');
+    if (roleUpper && parts.length > 2) {
+      var last = parts[parts.length - 1].toUpperCase();
+      if (last === roleUpper) parts = parts.slice(0, -1);
+    }
+    if (parts.length >= 2) {
+      return parts[0].toUpperCase() + ' - ' + parts[1].toUpperCase();
+    }
+    return parts.join(' - ');
+  }
+
   var pairForMethod = normalizePairName(pairRaw);
-  var pairLabel = pairRaw || pairForMethod;
+  var pairLabel = formatPairLabel(pairRaw, S.role) || pairRaw || pairForMethod;
+  var pair = pairForMethod;
+  if (gb && gb.data && gb.data.pairLedger) {
+    gb.data.pairLedger.customPairLabel = pairLabel;
+  }
 
   function symbolKey() {
     var p = (gb && gb.data && (gb.data.pairName || gb.data.pair)) ? (gb.data.pairName || gb.data.pair) : '';
@@ -195,7 +215,102 @@
   }
 
 
-  var wallet = Number.isFinite(gb.data.walletBalance) ? gb.data.walletBalance : 0;
+  function coerceNumber(val) {
+    if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+    if (typeof val === 'string' && val.length) {
+      var num = Number(val);
+      return Number.isFinite(num) ? num : null;
+    }
+    return null;
+  }
+
+  function pickRoleSpecific(obj, base, role) {
+    if (!obj || typeof obj !== 'object') return [];
+    var out = [];
+    var r = (typeof role === 'string') ? role : '';
+    if (!r.length) return out;
+    var cap = r.charAt(0).toUpperCase() + r.slice(1);
+    var upper = r.toUpperCase();
+    var lower = r.toLowerCase();
+    var candidates = [
+      base + cap,
+      base + upper,
+      base + lower,
+      base + '_' + cap,
+      base + '_' + upper,
+      base + '_' + lower,
+      lower + base.charAt(0).toUpperCase() + base.slice(1),
+      lower + base,
+      lower + '_' + base,
+      lower + '_' + base.toLowerCase()
+    ];
+    var seen = new Set();
+    for (var i = 0; i < candidates.length; i++) {
+      var key = candidates[i];
+      if (typeof key !== 'string' || !key.length) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (Object.prototype.hasOwnProperty.call(obj, key)) out.push(obj[key]);
+    }
+    return out;
+  }
+
+  function extractWalletBalance(data, role) {
+    if (!data || typeof data !== 'object') return 0;
+    var values = [];
+    function add(val) {
+      var num = coerceNumber(val);
+      if (num !== null) values.push(num);
+    }
+    add(data.walletBalance);
+    add(data.availableBalance);
+    add(data.wallet);
+    add(data.wallet_balance);
+    add(data.marginBalance);
+    add(data.margin_balance);
+    var roleFields = pickRoleSpecific(data, 'walletBalance', role)
+      .concat(pickRoleSpecific(data, 'wallet_balance', role))
+      .concat(pickRoleSpecific(data, 'availableBalance', role))
+      .concat(pickRoleSpecific(data, 'available_balance', role));
+    for (var rf of roleFields) add(rf);
+    if (data.wallets && typeof data.wallets === 'object') {
+      var roleLower = (typeof role === 'string') ? role.toLowerCase() : '';
+      var roleCap = roleLower ? roleLower.charAt(0).toUpperCase() + roleLower.slice(1) : '';
+      var roleUpper = roleLower.toUpperCase();
+      if (roleLower && Object.prototype.hasOwnProperty.call(data.wallets, roleLower)) add(data.wallets[roleLower]);
+      if (roleCap && Object.prototype.hasOwnProperty.call(data.wallets, roleCap)) add(data.wallets[roleCap]);
+      if (roleUpper && Object.prototype.hasOwnProperty.call(data.wallets, roleUpper)) add(data.wallets[roleUpper]);
+    }
+    if (data.roles && typeof data.roles === 'object') {
+      var rl = (typeof role === 'string') ? role.toLowerCase() : '';
+      var rc = rl ? rl.charAt(0).toUpperCase() + rl.slice(1) : '';
+      var ru = rl.toUpperCase();
+      var roleEntry = null;
+      if (rl && Object.prototype.hasOwnProperty.call(data.roles, rl)) roleEntry = data.roles[rl];
+      else if (rc && Object.prototype.hasOwnProperty.call(data.roles, rc)) roleEntry = data.roles[rc];
+      else if (ru && Object.prototype.hasOwnProperty.call(data.roles, ru)) roleEntry = data.roles[ru];
+      if (roleEntry && typeof roleEntry === 'object') {
+        add(roleEntry.walletBalance);
+        add(roleEntry.wallet);
+        add(roleEntry.availableBalance);
+        add(roleEntry.available_balance);
+      }
+    }
+    if (data.balances && typeof data.balances === 'object') {
+      var roleKey = (typeof role === 'string') ? role.toLowerCase() : '';
+      if (roleKey && Object.prototype.hasOwnProperty.call(data.balances, roleKey)) add(data.balances[roleKey]);
+    }
+    if (data.pairLedger && typeof data.pairLedger === 'object') {
+      add(data.pairLedger.walletBalance);
+    }
+    if (!values.length) return 0;
+    for (var vi = 0; vi < values.length; vi++) {
+      if (values[vi] !== 0) return values[vi];
+    }
+    return values[0];
+  }
+
+  var wallet = extractWalletBalance(gb.data, S.role);
   var qty = Number.isFinite(gb.data.currentQty) ? gb.data.currentQty : 0;
   var breakEven = Number.isFinite(gb.data.breakEven) ? gb.data.breakEven : 0;
   var liq = Number.isFinite(gb.data.liquidationPrice) ? gb.data.liquidationPrice : 0;
