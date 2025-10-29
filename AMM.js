@@ -201,8 +201,8 @@
   }
 
   var pairForMethod = normalizePairName(pairRaw);
-  var pairDisplay = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
-  var pair = pairForMethod;
+  var pairLabel = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
+  var pair = pairRaw && pairRaw.length ? pairRaw : pairForMethod;
   if (gb && gb.data && gb.data.pairLedger) {
     gb.data.pairLedger.customPairLabel = pairDisplay;
   }
