@@ -23,6 +23,7 @@
   // ====== Defaults ======
   if (typeof S.gridStepPct !== 'number') S.gridStepPct = 0.003;
   if (typeof S.allocPct !== 'number') S.allocPct = 0.05;
+  if (typeof S.midReservePct !== 'number') S.midReservePct = 0.30;
   if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;
   if (typeof S.skewK !== 'number') S.skewK = 0.8;
   if (typeof S.recenterEveryMs !== 'number') S.recenterEveryMs = 60_000;
@@ -45,6 +46,7 @@
 
   // Per-symbol overrides lagras i S.perSymbol["LINKUSDT"] = { minNotionalMultiplier, minNotionalBumpUSDT, absoluteMinQuoteUSDT, minNotionalOverride, minQtyOverride }
   if (!S.perSymbol || typeof S.perSymbol !== 'object') S.perSymbol = {};
+  if (typeof S.lastContractWarn !== 'string') S.lastContractWarn = '';
 
   // Reduce-only + autoshed
   if (typeof S.reduceOnlyTrims !== 'boolean') S.reduceOnlyTrims = true;
@@ -199,11 +201,130 @@
     return parts.join(' - ');
   }
 
+  function inspectContractType(marketInfo, pairLabel) {
+    var info = (marketInfo && typeof marketInfo === 'object') ? marketInfo : {};
+    var candidates = [];
+    var seen = new Set();
+    function addCandidate(val) {
+      if (typeof val !== 'string') return;
+      var trimmed = val.trim();
+      if (!trimmed.length || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      candidates.push(trimmed);
+    }
+
+    var typeFields = [
+      'contractType', 'contract_type', 'contract',
+      'contractCategory', 'contract_category', 'category',
+      'alias', 'productType', 'product_type',
+      'settleType', 'settle_type', 'marketType', 'market_type'
+    ];
+    for (var i = 0; i < typeFields.length; i++) {
+      var key = typeFields[i];
+      if (Object.prototype.hasOwnProperty.call(info, key)) addCandidate(info[key]);
+    }
+
+    var first = candidates.length ? candidates[0] : '';
+    var lowered = candidates.map(function(c){ return c.toLowerCase(); });
+    var hasPerp = lowered.some(function(c){ return c.indexOf('perp') >= 0; });
+    var hasFutures = lowered.some(function(c){ return c.indexOf('future') >= 0 || c.indexOf('deliver') >= 0; });
+
+    var expiryTs = 0;
+    var expiryFields = [
+      'deliveryTime', 'deliveryTs', 'deliveryTimestamp', 'delivery_date',
+      'delivery', 'expireTime', 'expireDate', 'expiryDate',
+      'settleTime', 'settlementTime', 'settleDate'
+    ];
+    for (var ei = 0; ei < expiryFields.length; ei++) {
+      var ekey = expiryFields[ei];
+      if (!Object.prototype.hasOwnProperty.call(info, ekey)) continue;
+      var raw = info[ekey];
+      if (raw == null) continue;
+      var num = Number(raw);
+      if (Number.isFinite(num) && num > 0) {
+        if (num < 1e12 && num > 1e6) num = num * 1000;
+        if (num > expiryTs) expiryTs = num;
+        continue;
+      }
+      if (typeof raw === 'string' && raw.length) {
+        var parsed = Date.parse(raw);
+        if (!Number.isNaN(parsed) && parsed > 0 && parsed > expiryTs) expiryTs = parsed;
+      }
+    }
+
+    var pairTxt = (typeof pairLabel === 'string') ? pairLabel : '';
+    var pairUpper = pairTxt.toUpperCase();
+    if (!hasPerp && pairUpper.indexOf('PERP') >= 0) hasPerp = true;
+    var hasDatedSuffix = /-[0-9]{1,2}[A-Z]{3}[0-9]{2}/.test(pairTxt);
+
+    var reason = '';
+    var isPerp = null;
+    if (hasPerp) {
+      isPerp = true;
+    } else if (hasFutures || expiryTs > 0 || hasDatedSuffix) {
+      isPerp = false;
+      var detail = first || (hasDatedSuffix ? 'termin med datum' : 'termin');
+      reason = 'Ej perpetual kontrakt' + (detail ? ' (' + detail + ')' : '');
+    }
+    if (isPerp === false && !reason.length) reason = 'Ej perpetual kontrakt';
+
+    var warnKey = first || (pairUpper.length ? pairUpper : 'unknown');
+    return { label: first, isPerp: isPerp, reason: reason, warnKey: warnKey, expiryTs: expiryTs, candidates: candidates };
+  }
+
   var pairForMethod = normalizePairName(pairRaw);
-  var pairLabel = formatPairLabel(pairRaw, S.role) || pairRaw || pairForMethod;
+  var pairDisplay = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
   var pair = pairForMethod;
+  var pairDebugLabel = pairDisplay && pairDisplay.length ? pairDisplay : pair;
+
+  function detectStrategyLabel() {
+    var candidates = [
+      gb && gb.data && gb.data.strategy,
+      gb && gb.data && gb.data.strategyName,
+      gb && gb.data && gb.data.whatstrat,
+      gb && gb.strategy,
+      gb && gb.strategyName,
+      gb && gb.whatstrat,
+      (gb && gb.data && gb.data.bot) ? gb.data.bot.strategy : null
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      var cand = candidates[i];
+      if (typeof cand === 'string' && cand.length) return cand;
+    }
+    return 'customStrategy';
+  }
+
+  function assignProps(target, source) {
+    if (!target || !source) return target;
+    for (var key in source) {
+      if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+      var val = source[key];
+      if (typeof val === 'undefined') continue;
+      target[key] = val;
+    }
+    return target;
+  }
+
+  var orderMetaDefaults = {};
+  assignProps(orderMetaDefaults, { whatstrat: detectStrategyLabel() });
+  if (pair && typeof pair === 'string' && pair.length) assignProps(orderMetaDefaults, { pair: pair });
+  if (pairDisplay && pairDisplay.length) assignProps(orderMetaDefaults, { pairLabel: pairDisplay });
+  if (typeof ex === 'string' && ex.length) assignProps(orderMetaDefaults, { exchange: ex });
+  if (typeof S.role === 'string' && S.role.length) assignProps(orderMetaDefaults, { role: S.role });
+
+  if (!S._loggedOrderMetaDefaults) {
+    console.log('[GRID]', S.role, 'order meta defaults', orderMetaDefaults);
+    S._loggedOrderMetaDefaults = true;
+  }
+
+  function createOrderOptions(extra) {
+    var opts = {};
+    assignProps(opts, orderMetaDefaults);
+    if (extra && typeof extra === 'object') assignProps(opts, extra);
+    return opts;
+  }
   if (gb && gb.data && gb.data.pairLedger) {
-    gb.data.pairLedger.customPairLabel = pairLabel;
+    gb.data.pairLedger.customPairLabel = pairDisplay;
   }
 
   function symbolKey() {
@@ -415,7 +536,26 @@
   var priceOk = (bid > 0 && ask > 0 && ask >= bid);
   if (priceOk) S.lastGoodTs = now;
   var pauseReason = '';
-  if (S.failsafeEnabled) {
+
+  var contractMeta = inspectContractType(m, pairRaw);
+  S._contractInfo = {
+    label: contractMeta.label || '',
+    isPerp: contractMeta.isPerp,
+    reason: contractMeta.reason || '',
+    expiryTs: contractMeta.expiryTs || 0,
+    candidates: contractMeta.candidates
+  };
+  if (contractMeta.isPerp === false) {
+    pauseReason = contractMeta.reason || 'Ej perpetual kontrakt';
+    if (S.lastContractWarn !== contractMeta.warnKey) {
+      S.lastContractWarn = contractMeta.warnKey;
+      console.log('[GRID]', S.role, 'pausar – endast perpetual stöds. pair=', pairDisplay, 'kontrakt=', contractMeta.label || '-');
+    }
+  } else if (S.lastContractWarn) {
+    S.lastContractWarn = '';
+  }
+
+  if (!pauseReason && S.failsafeEnabled) {
     var stale = now - S.lastGoodTs > S.maxStaleMs;
     if (!priceOk) pauseReason = 'Prisdata saknas';
     else if (stale) pauseReason = 'Prisdata inaktuell';
@@ -428,14 +568,36 @@
   }
 
   // ====== Center & step ======
-  var stepAbs = (price > 0 ? price : 1) * Math.max(0.0001, S.gridStepPct);
+  var priceRef = price > 0 ? price : 1;
+  var rawStepAbs = priceRef * Math.max(0.0001, S.gridStepPct);
+  var stepUnit = S.priceStep > 0 ? S.priceStep : fallbackTick;
+  if (!(stepUnit > 0)) stepUnit = rawStepAbs > 0 ? rawStepAbs : (priceRef * 0.0001);
+  var stepAbs = rawStepAbs;
+  if (stepUnit > 0) {
+    if (stepAbs < stepUnit) stepAbs = stepUnit;
+    var roundedStep = preciseRoundToStep(stepAbs, stepUnit);
+    if (!(roundedStep > 0) || roundedStep + 1e-12 < stepAbs) {
+      roundedStep = preciseCeilToStep(stepAbs, stepUnit);
+    }
+    if (!(roundedStep > 0)) roundedStep = stepUnit;
+    stepAbs = Math.max(stepUnit, roundedStep);
+  }
+  S._gridStepAbs = stepAbs;
+  S._gridStepUnit = stepUnit;
   var centerTarget = price > 0 ? (price - S.skewK * invRatio * stepAbs) : (S.center || 0);
   var drift = price > 0 ? Math.abs((S.center - centerTarget) / price) : 0;
   var driftThreshold = Math.max(0.001, S.gridStepPct / 2);
   var needRecenter = (!S.lastRecenterTs || (now - S.lastRecenterTs > S.recenterEveryMs)) || (drift > driftThreshold);
   if (typeof S.resetCenter !== 'boolean') S.resetCenter = false;
-  if (S.resetCenter && price > 0) { S.center = price; S.lastRecenterTs = now; S.resetCenter = false; }
-  else if (needRecenter) { S.center = centerTarget; S.lastRecenterTs = now; }
+  if (S.resetCenter && price > 0) {
+    S.center = fixPrice(price);
+    S.lastRecenterTs = now;
+    S.resetCenter = false;
+  }
+  else if (needRecenter) {
+    S.center = fixPrice(centerTarget);
+    S.lastRecenterTs = now;
+  }
 
   // ====== Dynamiska min-nivåer (auto + per symbol + override) ======
   var qtyStep = S.qtyStep > 0 ? S.qtyStep : 0.1;
@@ -489,19 +651,20 @@
     var pxIoc = (qty > 0) ? Math.max(bid, price * 0.999) : Math.min(ask, price * 1.001);
 
     function placeIOC(side, q, px, reduceOnly) {
+      var reduceOpts = reduceOnly ? { reduceOnly: true } : null;
       if (reduceOnly) {
         if (side === 'buy') {
-          if (hasMethod('buyMarketReduceOnly')) return gb.method.buyMarketReduceOnly(q, pair, ex);
-          if (hasMethod('buyIOC'))              return gb.method.buyIOC(q, px, pair, ex, { reduceOnly: true });
-          return gb.method.buyMarket(q, pair, ex, { reduceOnly: true });
+          if (hasMethod('buyMarketReduceOnly')) return gb.method.buyMarketReduceOnly(q, pair, ex, createOrderOptions(reduceOpts));
+          if (hasMethod('buyIOC'))              return gb.method.buyIOC(q, px, pair, ex, createOrderOptions(reduceOpts));
+          return gb.method.buyMarket(q, pair, ex, createOrderOptions(reduceOpts));
         } else {
-          if (hasMethod('sellMarketReduceOnly'))return gb.method.sellMarketReduceOnly(q, pair, ex);
-          if (hasMethod('sellIOC'))             return gb.method.sellIOC(q, px, pair, ex, { reduceOnly: true });
-          return gb.method.sellMarket(q, pair, ex, { reduceOnly: true });
+          if (hasMethod('sellMarketReduceOnly'))return gb.method.sellMarketReduceOnly(q, pair, ex, createOrderOptions(reduceOpts));
+          if (hasMethod('sellIOC'))             return gb.method.sellIOC(q, px, pair, ex, createOrderOptions(reduceOpts));
+          return gb.method.sellMarket(q, pair, ex, createOrderOptions(reduceOpts));
         }
       }
-      if (side === 'buy')  return hasMethod('buyMarket')  ? gb.method.buyMarket(q, pair, ex)  : gb.method.buyIOC(q, px, pair, ex);
-      return hasMethod('sellMarket') ? gb.method.sellMarket(q, pair, ex) : gb.method.sellIOC(q, px, pair, ex);
+      if (side === 'buy')  return hasMethod('buyMarket')  ? gb.method.buyMarket(q, pair, ex, createOrderOptions())  : gb.method.buyIOC(q, px, pair, ex, createOrderOptions());
+      return hasMethod('sellMarket') ? gb.method.sellMarket(q, pair, ex, createOrderOptions()) : gb.method.sellIOC(q, px, pair, ex, createOrderOptions());
     }
 
     try {
@@ -517,7 +680,20 @@
 
   // ====== Bygg grid ======
   var levels = Math.max(1, Math.min(orderPlan.levels, 25));
-  var allocQuote = freeMargin() * Math.max(0, Math.min(1, S.allocPct));
+  var freeNow = Math.max(0, freeMargin());
+  var reservePct = Math.max(0, Math.min(0.9, S.midReservePct));
+  var reserveQuote = freeNow * reservePct;
+  var dynamicQuote = Math.max(0, freeNow - reserveQuote);
+  var allocPct = Math.max(0, Math.min(1, S.allocPct));
+  var manualQuote = freeNow * allocPct;
+  var allocQuote = Math.min(freeNow, Math.max(dynamicQuote, manualQuote));
+
+  var skewFactor = Math.max(-1, Math.min(1, invRatio * (Number.isFinite(S.skewK) ? S.skewK : 0)));
+  var bidQuoteShare = Math.max(0, 0.5 * (1 - skewFactor));
+  var askQuoteShare = Math.max(0, 0.5 * (1 + skewFactor));
+  var bidAllocQuote = allocQuote * (bidQuoteShare / Math.max(1e-9, bidQuoteShare + askQuoteShare));
+  var askAllocQuote = allocQuote * (askQuoteShare / Math.max(1e-9, bidQuoteShare + askQuoteShare));
+
   var weights = []; for (var wi=1; wi<=levels; wi++) weights.push(1/wi);
   var wSum = weights.reduce(function(a,b){return a+b;},0);
 
@@ -529,22 +705,25 @@
     var a = fixPrice(S.center + i * stepAbs);
     bids.push(b); asks.push(a);
 
-    var perLevelQuote = allocQuote * (weights[i - 1] / wSum);
-    var baseAmt = perLevelQuote / Math.max(1e-9, (price > 0 ? price : 1));
-    // initial bump mot mid-minima (senare per-order mot faktisk px)
-    var hardMidBase = dynamicMinBaseMid;
+    var weightShare = weights[i - 1] / Math.max(1e-9, wSum);
 
-    if (!Number.isFinite(baseAmt) || baseAmt <= 0) baseAmt = 0;
-    baseAmt = Math.max(baseAmt, hardMidBase, minQtyEff);
+    function computeBaseAmt(sideQuoteAlloc) {
+      var perLevelQuote = sideQuoteAlloc * weightShare;
+      var pxRef = price > 0 ? price : 1;
+      var baseAmtSide = perLevelQuote / Math.max(1e-9, pxRef);
+      var hardMidBase = dynamicMinBaseMid;
 
-    // cap per order mot equity
-    var eqForCap = (S.startEquity > 0 ? S.startEquity : equity());
-    var maxQuote = Math.max(0, eqForCap * (Number.isFinite(S.maxOrderQuotePct)?S.maxOrderQuotePct:0.01));
-    if (maxQuote > 0 && toQuote(price, baseAmt) > maxQuote) baseAmt = maxQuote / Math.max(1e-9, price);
-    baseAmt = preciseRoundToStep(baseAmt, qtyStep);
+      if (!Number.isFinite(baseAmtSide) || baseAmtSide <= 0) baseAmtSide = 0;
+      baseAmtSide = Math.max(baseAmtSide, hardMidBase, minQtyEff);
 
-    sizeBaseB.push(baseAmt);
-    sizeBaseA.push(baseAmt);
+      var eqForCap = (S.startEquity > 0 ? S.startEquity : equity());
+      var maxQuote = Math.max(0, eqForCap * (Number.isFinite(S.maxOrderQuotePct)?S.maxOrderQuotePct:0.01));
+      if (maxQuote > 0 && toQuote(price, baseAmtSide) > maxQuote) baseAmtSide = maxQuote / Math.max(1e-9, price);
+      return preciseRoundToStep(baseAmtSide, qtyStep);
+    }
+
+    sizeBaseB.push(computeBaseAmt(bidAllocQuote));
+    sizeBaseA.push(computeBaseAmt(askAllocQuote));
   }
 
   // ====== Throttle/toleranser ======
@@ -663,7 +842,11 @@
     console.log('[GRID]', S.role, 'orderförlust – triggar omplanering. Saknar:', missTxt || 'okända id:n');
   }
   S.lastKnownOrders = currentKnownOrders;
-  if (S.forceRecenter) { S.center = centerTarget; S.lastRecenterTs = now2; S.forceRecenter = false; }
+  if (S.forceRecenter) {
+    S.center = fixPrice(centerTarget);
+    S.lastRecenterTs = now2;
+    S.forceRecenter = false;
+  }
   if (S.forceImmediateCycle) cycleDue = true;
 
   if (S.failsafeEnabled && S.openOrdersFailSince > 0 && (now2 - S.openOrdersFailSince > 3 * S.cooldownMs)) {
@@ -676,10 +859,14 @@
   var prevPauseKey = (S.paused ? S.lastPauseReason : '');
   var changed = prevPauseKey !== pauseReason;
   if (pauseReason) {
+    if (changed) {
+      console.log('[GRID]', S.role, 'failsafe aktiverad –', pauseReason, 'eq=', equity().toFixed(4), 'fm=', freeMargin().toFixed(4), 'pair=', pairDebugLabel);
+    }
     if (!S.paused || changed) { S.paused = true; S.lastPauseReason = pauseReason;
       gb.data.pairLedger.notifications = [{ text: 'FAILSAFE: ' + pauseReason + '. Pausar order.', variant: 'error', persist: false }]; }
   } else if (S.paused) {
     S.paused = false; S.lastPauseReason = '';
+    console.log('[GRID]', S.role, 'failsafe hävd – återupptar orderläggning. eq=', equity().toFixed(4), 'fm=', freeMargin().toFixed(4));
     gb.data.pairLedger.notifications = [{ text: 'Failsafe avklarad. Återupptar.', variant: 'success', persist: false }];
   }
 
@@ -729,18 +916,41 @@
       'open=' + oo.length,
       'mål=' + desired.length,
       'minQtyEff=' + minQtyEff, 'minNotEff=' + minNotEff,
-      'dynMinBase=' + dynamicMinBaseMid
+      'dynMinBase=' + dynamicMinBaseMid,
+      'gridBudget=' + allocQuote.toFixed(4),
+      'reserved=' + reserveQuote.toFixed(4),
+      'bidBudget=' + bidAllocQuote.toFixed(4),
+      'askBudget=' + askAllocQuote.toFixed(4),
+      'qty=' + qty.toFixed(6),
+      'invRatio=' + invRatio.toFixed(4)
     );
 
     if (desired.length === 0) {
       console.log('[GRID]', S.role, 'inga planerade order i denna cykel – alla nivåer uppfyllda eller budget=0');
     }
 
-    var replaceMethodName =
-      (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder' :
-      (gb.method && typeof gb.method.amendOrder   === 'function') ? 'amendOrder'   :
-      (gb.method && typeof gb.method.editOrder    === 'function') ? 'editOrder'    : '';
+    var replaceCandidates = [
+      'replaceOrder',
+      'amendOrder',
+      'amendActiveOrder',
+      'amendLinearOrder',
+      'modifyOrder',
+      'updateOrder',
+      'editOrder'
+    ];
+    var replaceMethodName = '';
+    for (var rci = 0; rci < replaceCandidates.length; rci++) {
+      var cand = replaceCandidates[rci];
+      if (gb.method && typeof gb.method[cand] === 'function') { replaceMethodName = cand; break; }
+    }
     var canReplace = Boolean(replaceMethodName);
+    if (!canReplace && !S._loggedReplaceMissing) {
+      S._loggedReplaceMissing = true;
+      console.log('[GRID]', S.role, 'kan inte amend/replace order – inget API-stöd hittat. Faller tillbaka till cancel+ny.');
+    } else if (canReplace && S._loggedReplaceMissing) {
+      S._loggedReplaceMissing = false;
+      console.log('[GRID]', S.role, 'hittade ersättningsmetod', replaceMethodName, '– kommer amend:a befintliga order.');
+    }
     var maxReplacesPerCycle = (Number.isFinite(orderPlan.maxReplacesPerCycle) && orderPlan.maxReplacesPerCycle > 0)
       ? orderPlan.maxReplacesPerCycle : orderPlan.maxPerCycle || Infinity;
     var replacedThisCycle = 0;
@@ -762,21 +972,29 @@
     }
 
     function placeLimit(side, qtyL, pxL, reduceOnly, postOnly) {
+      var baseOpts = {};
+      if (reduceOnly) baseOpts.reduceOnly = true;
+      if (postOnly || S.usePostOnly) baseOpts.postOnly = true;
+      var limitOpts = createOrderOptions(baseOpts);
+      if (!Number.isFinite(S._lastLimitOptsLog) || (now2 - S._lastLimitOptsLog) > Math.max(15_000, S.cooldownMs || 0)) {
+        console.log('[GRID]', S.role, 'orderOpts', limitOpts);
+        S._lastLimitOptsLog = now2;
+      }
       if (reduceOnly) {
         if (side === 'buy') {
-          if (hasMethod('buyLimitReduceOnly'))  return gb.method.buyLimitReduceOnly(qtyL, pxL, pair, ex);
-          if (hasMethod('buyLimit'))            return gb.method.buyLimit(qtyL, pxL, pair, ex, { reduceOnly: true });
+          if (hasMethod('buyLimitReduceOnly'))  return gb.method.buyLimitReduceOnly(qtyL, pxL, pair, ex, limitOpts);
+          if (hasMethod('buyLimit'))            return gb.method.buyLimit(qtyL, pxL, pair, ex, limitOpts);
         } else {
-          if (hasMethod('sellLimitReduceOnly')) return gb.method.sellLimitReduceOnly(qtyL, pxL, pair, ex);
-          if (hasMethod('sellLimit'))           return gb.method.sellLimit(qtyL, pxL, pair, ex, { reduceOnly: true });
+          if (hasMethod('sellLimitReduceOnly')) return gb.method.sellLimitReduceOnly(qtyL, pxL, pair, ex, limitOpts);
+          if (hasMethod('sellLimit'))           return gb.method.sellLimit(qtyL, pxL, pair, ex, limitOpts);
         }
       }
       if (postOnly || S.usePostOnly) {
-        if (side === 'buy' && hasMethod('buyLimitPostOnly'))  return gb.method.buyLimitPostOnly(qtyL, pxL, pair, ex);
-        if (side === 'sell' && hasMethod('sellLimitPostOnly')) return gb.method.sellLimitPostOnly(qtyL, pxL, pair, ex);
+        if (side === 'buy' && hasMethod('buyLimitPostOnly'))  return gb.method.buyLimitPostOnly(qtyL, pxL, pair, ex, limitOpts);
+        if (side === 'sell' && hasMethod('sellLimitPostOnly')) return gb.method.sellLimitPostOnly(qtyL, pxL, pair, ex, limitOpts);
       }
-      if (side === 'buy')  return gb.method.buyLimit(qtyL, pxL, pair, ex);
-      return gb.method.sellLimit(qtyL, pxL, pair, ex);
+      if (side === 'buy')  return gb.method.buyLimit(qtyL, pxL, pair, ex, limitOpts);
+      return gb.method.sellLimit(qtyL, pxL, pair, ex, limitOpts);
     }
 
     async function placeOne(side, px, amt, tag) {
@@ -799,13 +1017,13 @@
               var pxIoc = (qty > 0) ? Math.max(bid, price * 0.999) : Math.min(ask, price * 1.001);
               var resRO = await callWithTimeout(safePromise(function(){
                 if (qty > 0) {
-                  if (hasMethod('sellMarketReduceOnly')) return gb.method.sellMarketReduceOnly(posAbs, pair, ex);
-                  if (hasMethod('sellIOC'))             return gb.method.sellIOC(posAbs, fixPrice(pxIoc), pair, ex, { reduceOnly: true });
-                  return gb.method.sellMarket(posAbs, pair, ex, { reduceOnly: true });
+                  if (hasMethod('sellMarketReduceOnly')) return gb.method.sellMarketReduceOnly(posAbs, pair, ex, createOrderOptions({ reduceOnly: true }));
+                  if (hasMethod('sellIOC'))             return gb.method.sellIOC(posAbs, fixPrice(pxIoc), pair, ex, createOrderOptions({ reduceOnly: true }));
+                  return gb.method.sellMarket(posAbs, pair, ex, createOrderOptions({ reduceOnly: true }));
                 } else {
-                  if (hasMethod('buyMarketReduceOnly')) return gb.method.buyMarketReduceOnly(posAbs, pair, ex);
-                  if (hasMethod('buyIOC'))              return gb.method.buyIOC(posAbs, fixPrice(pxIoc), pair, ex, { reduceOnly: true });
-                  return gb.method.buyMarket(posAbs, pair, ex, { reduceOnly: true });
+                  if (hasMethod('buyMarketReduceOnly')) return gb.method.buyMarketReduceOnly(posAbs, pair, ex, createOrderOptions({ reduceOnly: true }));
+                  if (hasMethod('buyIOC'))              return gb.method.buyIOC(posAbs, fixPrice(pxIoc), pair, ex, createOrderOptions({ reduceOnly: true }));
+                  return gb.method.buyMarket(posAbs, pair, ex, createOrderOptions({ reduceOnly: true }));
                 }
               }), Math.max(8_000, S.localOrderTimeoutMs), 'trim-RO-ioc');
               clearApiFailure();
@@ -904,8 +1122,13 @@
       if (!Number.isFinite(q) || q <= 0) return false;
       var qOk = preciseRoundToStep(q, qtyStep);
       var pxOk = fixPrice(target.px);
+      var reduceOnlyTarget = !!(target.tag && String(target.tag).indexOf('|RO') >= 0);
       try {
-        await callWithTimeout(safePromise(function(){ return gb.method[replaceMethodName](id, qOk, pxOk, pair, ex); }), S.localOrderTimeoutMs, 'replace order');
+        var prevRate = rateFromOrder(order) || 0;
+        var amendOpts = createOrderOptions(reduceOnlyTarget ? { reduceOnly: true } : null);
+        var callArgs = [id, qOk, pxOk, pair, ex, amendOpts];
+        console.log('[GRID]', S.role, 'amend', replaceMethodName, 'id=', id, 'från', Number(prevRate || 0).toFixed(6), 'till', pxOk.toFixed(6), 'qty', qOk, reduceOnlyTarget ? '(RO)' : '');
+        await callWithTimeout(safePromise(function(){ return gb.method[replaceMethodName].apply(gb.method, callArgs); }), S.localOrderTimeoutMs, 'replace order');
         clearApiFailure();
         target.matched = true; replacedThisCycle++;
         console.log('[GRID]', S.role, 'replaced', sideFromOrder(order), qOk, '@', pxOk);
@@ -921,7 +1144,7 @@
       var id = typeof orderOrId === 'string' ? orderOrId : idFromOrder(orderOrId);
       if (!id) return false;
       try {
-        await callWithTimeout(safePromise(function(){ return gb.method.cancelOrder(id, pair, ex); }), S.localOrderTimeoutMs, 'cancel order');
+        await callWithTimeout(safePromise(function(){ return gb.method.cancelOrder(id, pair, ex, createOrderOptions()); }), S.localOrderTimeoutMs, 'cancel order');
         clearApiFailure();
         return true;
       } catch (err) {
@@ -964,7 +1187,12 @@
       }
       if (!handled) {
         if (S.apiBackoffUntil > Date.now()) break;
-        await cancelOne(o);
+        if (!canReplace) {
+          console.log('[GRID]', S.role, 'ingen amend-metod – avbryter order för att lägga ny @', target ? target.px : rate);
+          await cancelOne(o);
+        } else {
+          console.log('[GRID]', S.role, 'amend misslyckades – behåller order och försöker igen senare. id=', idFromOrder(o) || '-');
+        }
         if (S.apiBackoffUntil > Date.now()) break;
       }
     }
@@ -1114,9 +1342,10 @@
   if (Number.isFinite(S.center) && S.center > 0) lines.push(makeLine('Rutnätscenter', S.center, S.paused ? '#9aa0b8' : '#78a6ff', 1));
   for (var li=0; li<Math.min(8, orderPlan.levels); li++) {
     var step = (price > 0 ? price : 1) * S.gridStepPct;
+    var chartStep = S._gridStepAbs > 0 ? S._gridStepAbs : step;
     var isNext = li === 0;
-    lines.push(makeLine('Köp nivå ' + (li + 1), S.center - (li + 1) * step, S.paused ? '#295c3a' : (isNext ? '#00ff94' : '#53cf77')));
-    lines.push(makeLine('Sälj nivå ' + (li + 1), S.center + (li + 1) * step, S.paused ? '#6b2d2d' : (isNext ? '#ff5a5a' : '#cf5353')));
+    lines.push(makeLine('Köp nivå ' + (li + 1), S.center - (li + 1) * chartStep, S.paused ? '#295c3a' : (isNext ? '#00ff94' : '#53cf77')));
+    lines.push(makeLine('Sälj nivå ' + (li + 1), S.center + (li + 1) * chartStep, S.paused ? '#6b2d2d' : (isNext ? '#ff5a5a' : '#cf5353')));
   }
   if (be > 0) lines.push(makeLine('Break-even', be, '#ffd166', 3));
   if (liq > 0) lines.push(makeLine('Likvidation', liq, '#ef476f', 3));
@@ -1124,18 +1353,32 @@
 
   var statusTxt = S.paused ? ('PAUSAD: ' + (S.lastPauseReason || 'okänt')) : (S.apiBackoffUntil > Date.now() ? ('API-VILA (' + Math.ceil((S.apiBackoffUntil - Date.now())/1000) + 's)') : 'AKTIV');
   var lastFillTxt = S.lastFillTs ? new Date(S.lastFillTs).toLocaleTimeString('sv-SE') : '–';
+  var contractInfo = S._contractInfo || {};
+  var contractLabel = contractInfo.label && contractInfo.label.length ? contractInfo.label : '-';
+  var contractPerpTxt = (contractInfo.isPerp === false)
+    ? ('NEJ' + (contractInfo.reason ? ' – ' + contractInfo.reason : ''))
+    : ((contractInfo.isPerp === true) ? 'JA' : 'Okänd');
+
   gb.data.pairLedger.sidebarExtras = [
     { label: 'Roll', value: S.role.toUpperCase() },
     { label: 'Status', value: statusTxt, valueColor: S.paused ? '#ffb4a2' : '#b7f7c1' },
+    { label: 'Kontraktstyp', value: contractLabel },
+    { label: 'Perpetual?', value: contractPerpTxt },
     { label: 'Senaste fyllning', value: lastFillTxt },
     { label: 'Pris', value: (curP).toFixed(6) },
     { label: 'Center', value: S.center.toFixed(6) },
     { label: 'Steg %', value: (S.gridStepPct * 100).toFixed(3) + '%' },
+    { label: 'Steg (abs)', value: (S._gridStepAbs > 0 ? S._gridStepAbs : 0).toFixed(6) },
     { label: 'Nivåer/ben', value: String(orderPlan.levels) },
     { label: 'Dyn minBase(mid)', value: String(S.dynamicMinBase || 0) },
     { label: 'MinQtyEff', value: String(S._minQtyEff || 0) },
     { label: 'MinNotEff(USDT)', value: String(S._minNotEff || 0) },
     { label: 'Allokering %', value: (S.allocPct * 100).toFixed(0) + '%' },
+    { label: 'Gridbudget (USDT)', value: allocQuote.toFixed(2) },
+    { label: 'Reserv mitt %', value: (reservePct * 100).toFixed(0) + '%' },
+    { label: 'Reserv mitt (USDT)', value: reserveQuote.toFixed(2) },
+    { label: 'Budgetsida köp', value: bidAllocQuote.toFixed(2) },
+    { label: 'Budgetsida sälj', value: askAllocQuote.toFixed(2) },
     { label: 'Hävarm', value: String(lev) + 'x' },
     { label: 'Plånbok', value: (Number.isFinite(wallet) ? wallet : 0).toFixed(2) },
     { label: 'Eget kapital (nu)', value: (curEq).toFixed(2) },
@@ -1160,8 +1403,15 @@
   var desiredTotal = Array.isArray(S.lastDesiredShape) ? S.lastDesiredShape.length : 0;
   console.log('[GRID] role=' + S.role + ' status=' + statusTxt + ' p=' + (price>0?price:0).toFixed(6) +
     ' center=' + S.center.toFixed(6) + ' step%=' + (S.gridStepPct*100).toFixed(3) +
+    ' stepAbs=' + (stepAbs > 0 ? stepAbs.toFixed(6) : '0') +
     ' levels=' + orderPlan.levels + ' mål=' + desiredTotal +
     ' minQtyEff=' + minQtyEff + ' minNotEff=' + minNotEff +
-    ' dynMinBase=' + dynamicMinBaseMid
+    ' dynMinBase=' + dynamicMinBaseMid +
+    ' gridBudget=' + allocQuote.toFixed(4) +
+    ' reserved=' + reserveQuote.toFixed(4) +
+    ' bidBudget=' + bidAllocQuote.toFixed(4) +
+    ' askBudget=' + askAllocQuote.toFixed(4) +
+    ' kontrakt=' + contractLabel +
+    ' perp=' + ((contractInfo.isPerp === false) ? 'NEJ' : (contractInfo.isPerp === true ? 'JA' : 'okänd'))
   );
 })();
