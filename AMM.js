@@ -872,9 +872,7 @@
       'gridBudget=' + allocQuote.toFixed(4),
       'reserved=' + reserveQuote.toFixed(4),
       'bidBudget=' + bidAllocQuote.toFixed(4),
-      'askBudget=' + askAllocQuote.toFixed(4),
-      'qty=' + qty.toFixed(6),
-      'invRatio=' + invRatio.toFixed(4)
+      'askBudget=' + askAllocQuote.toFixed(4)
     );
 
     if (desired.length === 0) {
