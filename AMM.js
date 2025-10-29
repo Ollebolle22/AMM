@@ -46,6 +46,7 @@
 
   // Per-symbol overrides lagras i S.perSymbol["LINKUSDT"] = { minNotionalMultiplier, minNotionalBumpUSDT, absoluteMinQuoteUSDT, minNotionalOverride, minQtyOverride }
   if (!S.perSymbol || typeof S.perSymbol !== 'object') S.perSymbol = {};
+  if (typeof S.lastContractWarn !== 'string') S.lastContractWarn = '';
 
   // Reduce-only + autoshed
   if (typeof S.reduceOnlyTrims !== 'boolean') S.reduceOnlyTrims = true;
@@ -198,6 +199,77 @@
       return parts[0].toUpperCase() + ' - ' + parts[1].toUpperCase();
     }
     return parts.join(' - ');
+  }
+
+  function inspectContractType(marketInfo, pairLabel) {
+    var info = (marketInfo && typeof marketInfo === 'object') ? marketInfo : {};
+    var candidates = [];
+    var seen = new Set();
+    function addCandidate(val) {
+      if (typeof val !== 'string') return;
+      var trimmed = val.trim();
+      if (!trimmed.length || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      candidates.push(trimmed);
+    }
+
+    var typeFields = [
+      'contractType', 'contract_type', 'contract',
+      'contractCategory', 'contract_category', 'category',
+      'alias', 'productType', 'product_type',
+      'settleType', 'settle_type', 'marketType', 'market_type'
+    ];
+    for (var i = 0; i < typeFields.length; i++) {
+      var key = typeFields[i];
+      if (Object.prototype.hasOwnProperty.call(info, key)) addCandidate(info[key]);
+    }
+
+    var first = candidates.length ? candidates[0] : '';
+    var lowered = candidates.map(function(c){ return c.toLowerCase(); });
+    var hasPerp = lowered.some(function(c){ return c.indexOf('perp') >= 0; });
+    var hasFutures = lowered.some(function(c){ return c.indexOf('future') >= 0 || c.indexOf('deliver') >= 0; });
+
+    var expiryTs = 0;
+    var expiryFields = [
+      'deliveryTime', 'deliveryTs', 'deliveryTimestamp', 'delivery_date',
+      'delivery', 'expireTime', 'expireDate', 'expiryDate',
+      'settleTime', 'settlementTime', 'settleDate'
+    ];
+    for (var ei = 0; ei < expiryFields.length; ei++) {
+      var ekey = expiryFields[ei];
+      if (!Object.prototype.hasOwnProperty.call(info, ekey)) continue;
+      var raw = info[ekey];
+      if (raw == null) continue;
+      var num = Number(raw);
+      if (Number.isFinite(num) && num > 0) {
+        if (num < 1e12 && num > 1e6) num = num * 1000;
+        if (num > expiryTs) expiryTs = num;
+        continue;
+      }
+      if (typeof raw === 'string' && raw.length) {
+        var parsed = Date.parse(raw);
+        if (!Number.isNaN(parsed) && parsed > 0 && parsed > expiryTs) expiryTs = parsed;
+      }
+    }
+
+    var pairTxt = (typeof pairLabel === 'string') ? pairLabel : '';
+    var pairUpper = pairTxt.toUpperCase();
+    if (!hasPerp && pairUpper.indexOf('PERP') >= 0) hasPerp = true;
+    var hasDatedSuffix = /-[0-9]{1,2}[A-Z]{3}[0-9]{2}/.test(pairTxt);
+
+    var reason = '';
+    var isPerp = null;
+    if (hasPerp) {
+      isPerp = true;
+    } else if (hasFutures || expiryTs > 0 || hasDatedSuffix) {
+      isPerp = false;
+      var detail = first || (hasDatedSuffix ? 'termin med datum' : 'termin');
+      reason = 'Ej perpetual kontrakt' + (detail ? ' (' + detail + ')' : '');
+    }
+    if (isPerp === false && !reason.length) reason = 'Ej perpetual kontrakt';
+
+    var warnKey = first || (pairUpper.length ? pairUpper : 'unknown');
+    return { label: first, isPerp: isPerp, reason: reason, warnKey: warnKey, expiryTs: expiryTs, candidates: candidates };
   }
 
   var pairForMethod = normalizePairName(pairRaw);
@@ -416,7 +488,26 @@
   var priceOk = (bid > 0 && ask > 0 && ask >= bid);
   if (priceOk) S.lastGoodTs = now;
   var pauseReason = '';
-  if (S.failsafeEnabled) {
+
+  var contractMeta = inspectContractType(m, pairRaw);
+  S._contractInfo = {
+    label: contractMeta.label || '',
+    isPerp: contractMeta.isPerp,
+    reason: contractMeta.reason || '',
+    expiryTs: contractMeta.expiryTs || 0,
+    candidates: contractMeta.candidates
+  };
+  if (contractMeta.isPerp === false) {
+    pauseReason = contractMeta.reason || 'Ej perpetual kontrakt';
+    if (S.lastContractWarn !== contractMeta.warnKey) {
+      S.lastContractWarn = contractMeta.warnKey;
+      console.log('[GRID]', S.role, 'pausar – endast perpetual stöds. pair=', pairDisplay, 'kontrakt=', contractMeta.label || '-');
+    }
+  } else if (S.lastContractWarn) {
+    S.lastContractWarn = '';
+  }
+
+  if (!pauseReason && S.failsafeEnabled) {
     var stale = now - S.lastGoodTs > S.maxStaleMs;
     if (!priceOk) pauseReason = 'Prisdata saknas';
     else if (stale) pauseReason = 'Prisdata inaktuell';
@@ -1172,9 +1263,17 @@
 
   var statusTxt = S.paused ? ('PAUSAD: ' + (S.lastPauseReason || 'okänt')) : (S.apiBackoffUntil > Date.now() ? ('API-VILA (' + Math.ceil((S.apiBackoffUntil - Date.now())/1000) + 's)') : 'AKTIV');
   var lastFillTxt = S.lastFillTs ? new Date(S.lastFillTs).toLocaleTimeString('sv-SE') : '–';
+  var contractInfo = S._contractInfo || {};
+  var contractLabel = contractInfo.label && contractInfo.label.length ? contractInfo.label : '-';
+  var contractPerpTxt = (contractInfo.isPerp === false)
+    ? ('NEJ' + (contractInfo.reason ? ' – ' + contractInfo.reason : ''))
+    : ((contractInfo.isPerp === true) ? 'JA' : 'Okänd');
+
   gb.data.pairLedger.sidebarExtras = [
     { label: 'Roll', value: S.role.toUpperCase() },
     { label: 'Status', value: statusTxt, valueColor: S.paused ? '#ffb4a2' : '#b7f7c1' },
+    { label: 'Kontraktstyp', value: contractLabel },
+    { label: 'Perpetual?', value: contractPerpTxt },
     { label: 'Senaste fyllning', value: lastFillTxt },
     { label: 'Pris', value: (curP).toFixed(6) },
     { label: 'Center', value: S.center.toFixed(6) },
