@@ -34,6 +34,7 @@
   if (typeof S.usePostOnly !== 'boolean') S.usePostOnly = false;
   if (typeof S.localOrderTimeoutMs !== 'number') S.localOrderTimeoutMs = 15_000;
   if (typeof S.leverage !== 'number') S.leverage = 10;
+  if (!S.orderOptions || typeof S.orderOptions !== 'object') S.orderOptions = {};
 
   // Auto-minimum: globala overrides + kompatibilitet med tidigare bump-procent
   if (typeof S.minNotionalOverride !== 'number') S.minNotionalOverride = 0; // USDT
@@ -199,6 +200,24 @@
       return parts[0].toUpperCase() + ' - ' + parts[1].toUpperCase();
     }
     return parts.join(' - ');
+  }
+
+  function buildOrderOptions(overrides) {
+    var result = {};
+
+    function applyOptions(src) {
+      if (!src || typeof src !== 'object') return;
+      Object.keys(src).forEach(function (key) {
+        var val = src[key];
+        if (typeof val !== 'undefined') result[key] = val;
+      });
+    }
+
+    applyOptions(gb && gb.data && typeof gb.data.orderOptions === 'object' ? gb.data.orderOptions : null);
+    applyOptions(S && typeof S.orderOptions === 'object' ? S.orderOptions : null);
+    applyOptions(overrides && typeof overrides === 'object' ? overrides : null);
+
+    return result;
   }
 
   function inspectContractType(marketInfo, pairLabel) {
