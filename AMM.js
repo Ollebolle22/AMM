@@ -273,8 +273,8 @@
   }
 
   var pairForMethod = normalizePairName(pairRaw);
-  var pairDisplay = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
-  var pair = pairForMethod;
+  var pairLabel = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
+  var pair = pairRaw && pairRaw.length ? pairRaw : pairForMethod;
   if (gb && gb.data && gb.data.pairLedger) {
     gb.data.pairLedger.customPairLabel = pairDisplay;
   }
@@ -1320,8 +1320,6 @@
     ' gridBudget=' + allocQuote.toFixed(4) +
     ' reserved=' + reserveQuote.toFixed(4) +
     ' bidBudget=' + bidAllocQuote.toFixed(4) +
-    ' askBudget=' + askAllocQuote.toFixed(4) +
-    ' kontrakt=' + contractLabel +
-    ' perp=' + ((contractInfo.isPerp === false) ? 'NEJ' : (contractInfo.isPerp === true ? 'JA' : 'okänd'))
+    ' askBudget=' + askAllocQuote.toFixed(4)
   );
 })();
