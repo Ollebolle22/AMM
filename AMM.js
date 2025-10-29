@@ -1295,8 +1295,23 @@
 
         var res = await callWithTimeout(safePromise(function(){ return placeLimit(side, amtOk, pxOk, reduceOnly, S.usePostOnly); }), S.localOrderTimeoutMs, 'place order');
 
-        var failureAnalysis = analyzePlacementFailure(res);
-        var ok = !failureAnalysis.failed;
+        var ok = (typeof res === 'undefined' || res === null);
+        if (res === true) ok = true;
+        if (!ok && res) {
+          if (res.orderId || res.id || res.clientOrderId || res.client_order_id) ok = true;
+          if (!ok && res.result && typeof res.result === 'object') {
+            var rres = res.result;
+            if (rres.orderId || rres.order_id || rres.orderID || rres.id || rres.orderLinkId || rres.order_link_id) ok = true;
+          }
+          if (!ok && res.data && typeof res.data === 'object') {
+            var dres = res.data;
+            if (dres.orderId || dres.order_id || dres.orderID || dres.id || dres.orderLinkId || dres.order_link_id) ok = true;
+          }
+          if (res.success === true || res.success === 'success' || res.success === 'ok') ok = true;
+          if (!ok && typeof res.retCode !== 'undefined') ok = (Number(res.retCode) === 0 || String(res.retCode) === '0');
+          if (!ok && typeof res.ret_code !== 'undefined') ok = (Number(res.ret_code) === 0 || String(res.ret_code) === '0');
+          if (!ok && typeof res.retMsg === 'string' && res.retMsg.toLowerCase() === 'ok') ok = true;
+        }
         if (!ok) {
           var errMsg = extractErrorMessage(res);
           var extraInfo = [];
