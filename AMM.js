@@ -1130,8 +1130,9 @@
 
         var res = await callWithTimeout(safePromise(function(){ return placeLimit(side, amtOk, pxOk, reduceOnly, S.usePostOnly); }), S.localOrderTimeoutMs, 'place order');
 
-        var ok = false;
-        if (res) {
+        var ok = (typeof res === 'undefined' || res === null);
+        if (res === true) ok = true;
+        if (!ok && res) {
           if (res.orderId || res.id || res.clientOrderId || res.client_order_id) ok = true;
           if (!ok && res.result && typeof res.result === 'object') {
             var rres = res.result;
