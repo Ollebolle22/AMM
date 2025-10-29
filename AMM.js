@@ -245,19 +245,50 @@
     if (!hasMethod(name)) throw new Error('Method not available: ' + name);
     var fn = gb.method[name];
     var args = Array.isArray(baseArgs) ? baseArgs.slice() : [];
-    var opts = (options && typeof options === 'object') ? Object.assign({}, options) : buildOrderOptions();
-    if (typeof opts.whatstrat !== 'string' || !opts.whatstrat.length) {
-      opts.whatstrat = defaultWhatstrat();
-    }
+
     var expected = Number.isFinite(fn.length) ? fn.length : 0;
-    if (!(expected > 0)) expected = args.length + 1;
-    if (expected <= args.length) {
-      args.push(opts);
-    } else {
+    if (expected > 0 && expected - 1 > args.length) {
       while (args.length < expected - 1) args.push(null);
-      args.push(opts);
     }
-    return fn.apply(gb.method, args);
+
+    var opts = buildOrderOptions(options);
+    args.push(opts);
+
+    var expectsCallback = expected > 0 && expected > args.length;
+
+    if (!expectsCallback) {
+      return fn.apply(gb.method, args);
+    }
+
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      function finish(err, result) {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err); else resolve(result);
+      }
+
+      var callArgs = args.slice();
+      callArgs.push(function () {
+        var err = arguments[0];
+        if (err) { finish(err); return; }
+        if (arguments.length <= 1) { finish(null, { success: true }); return; }
+        if (arguments.length === 2) { finish(null, arguments[1]); return; }
+        var payload = Array.prototype.slice.call(arguments, 1);
+        finish(null, payload.length === 1 ? payload[0] : payload);
+      });
+
+      try {
+        var ret = fn.apply(gb.method, callArgs);
+        if (ret && typeof ret.then === 'function') {
+          ret.then(function (val) { finish(null, val); }, function (err) { finish(err); });
+        } else if (typeof ret !== 'undefined') {
+          finish(null, ret);
+        }
+      } catch (err) {
+        finish(err);
+      }
+    });
   }
 
   function inspectContractType(marketInfo, pairLabel) {
@@ -1102,8 +1133,18 @@
         var ok = false;
         if (res) {
           if (res.orderId || res.id || res.clientOrderId || res.client_order_id) ok = true;
-          if (res.success === true) ok = true;
-          if (typeof res.retCode !== 'undefined') ok = (Number(res.retCode) === 0 || String(res.retCode) === '0');
+          if (!ok && res.result && typeof res.result === 'object') {
+            var rres = res.result;
+            if (rres.orderId || rres.order_id || rres.orderID || rres.id || rres.orderLinkId || rres.order_link_id) ok = true;
+          }
+          if (!ok && res.data && typeof res.data === 'object') {
+            var dres = res.data;
+            if (dres.orderId || dres.order_id || dres.orderID || dres.id || dres.orderLinkId || dres.order_link_id) ok = true;
+          }
+          if (res.success === true || res.success === 'success' || res.success === 'ok') ok = true;
+          if (!ok && typeof res.retCode !== 'undefined') ok = (Number(res.retCode) === 0 || String(res.retCode) === '0');
+          if (!ok && typeof res.ret_code !== 'undefined') ok = (Number(res.ret_code) === 0 || String(res.ret_code) === '0');
+          if (!ok && typeof res.retMsg === 'string' && res.retMsg.toLowerCase() === 'ok') ok = true;
         }
         if (!ok) {
           var errMsg = (res && (res.retMsg || res.msg || res.message)) ? (res.retMsg || res.msg || res.message) : null;
