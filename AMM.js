@@ -276,53 +276,6 @@
   var pairDisplay = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
   var pair = pairForMethod;
   var pairDebugLabel = pairDisplay && pairDisplay.length ? pairDisplay : pair;
-
-  function detectStrategyLabel() {
-    var candidates = [
-      gb && gb.data && gb.data.strategy,
-      gb && gb.data && gb.data.strategyName,
-      gb && gb.data && gb.data.whatstrat,
-      gb && gb.strategy,
-      gb && gb.strategyName,
-      gb && gb.whatstrat,
-      (gb && gb.data && gb.data.bot) ? gb.data.bot.strategy : null
-    ];
-    for (var i = 0; i < candidates.length; i++) {
-      var cand = candidates[i];
-      if (typeof cand === 'string' && cand.length) return cand;
-    }
-    return 'customStrategy';
-  }
-
-  function assignProps(target, source) {
-    if (!target || !source) return target;
-    for (var key in source) {
-      if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
-      var val = source[key];
-      if (typeof val === 'undefined') continue;
-      target[key] = val;
-    }
-    return target;
-  }
-
-  var orderMetaDefaults = {};
-  assignProps(orderMetaDefaults, { whatstrat: detectStrategyLabel() });
-  if (pair && typeof pair === 'string' && pair.length) assignProps(orderMetaDefaults, { pair: pair });
-  if (pairDisplay && pairDisplay.length) assignProps(orderMetaDefaults, { pairLabel: pairDisplay });
-  if (typeof ex === 'string' && ex.length) assignProps(orderMetaDefaults, { exchange: ex });
-  if (typeof S.role === 'string' && S.role.length) assignProps(orderMetaDefaults, { role: S.role });
-
-  if (!S._loggedOrderMetaDefaults) {
-    console.log('[GRID]', S.role, 'order meta defaults', orderMetaDefaults);
-    S._loggedOrderMetaDefaults = true;
-  }
-
-  function buildOrderOptions(extra) {
-    var opts = {};
-    assignProps(opts, orderMetaDefaults);
-    if (extra && typeof extra === 'object') assignProps(opts, extra);
-    return opts;
-  }
   if (gb && gb.data && gb.data.pairLedger) {
     gb.data.pairLedger.customPairLabel = pairDisplay;
   }
@@ -920,9 +873,7 @@
       'gridBudget=' + allocQuote.toFixed(4),
       'reserved=' + reserveQuote.toFixed(4),
       'bidBudget=' + bidAllocQuote.toFixed(4),
-      'askBudget=' + askAllocQuote.toFixed(4),
-      'qty=' + qty.toFixed(6),
-      'invRatio=' + invRatio.toFixed(4)
+      'askBudget=' + askAllocQuote.toFixed(4)
     );
 
     if (desired.length === 0) {
@@ -1125,8 +1076,8 @@
       var reduceOnlyTarget = !!(target.tag && String(target.tag).indexOf('|RO') >= 0);
       try {
         var prevRate = rateFromOrder(order) || 0;
-        var amendOpts = buildOrderOptions(reduceOnlyTarget ? { reduceOnly: true } : null);
-        var callArgs = [id, qOk, pxOk, pair, ex, amendOpts];
+        var callArgs = [id, qOk, pxOk, pair, ex];
+        if (reduceOnlyTarget) callArgs.push({ reduceOnly: true });
         console.log('[GRID]', S.role, 'amend', replaceMethodName, 'id=', id, 'från', Number(prevRate || 0).toFixed(6), 'till', pxOk.toFixed(6), 'qty', qOk, reduceOnlyTarget ? '(RO)' : '');
         await callWithTimeout(safePromise(function(){ return gb.method[replaceMethodName].apply(gb.method, callArgs); }), S.localOrderTimeoutMs, 'replace order');
         clearApiFailure();
