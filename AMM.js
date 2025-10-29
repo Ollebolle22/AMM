@@ -429,14 +429,36 @@
   }
 
   // ====== Center & step ======
-  var stepAbs = (price > 0 ? price : 1) * Math.max(0.0001, S.gridStepPct);
+  var priceRef = price > 0 ? price : 1;
+  var rawStepAbs = priceRef * Math.max(0.0001, S.gridStepPct);
+  var stepUnit = S.priceStep > 0 ? S.priceStep : fallbackTick;
+  if (!(stepUnit > 0)) stepUnit = rawStepAbs > 0 ? rawStepAbs : (priceRef * 0.0001);
+  var stepAbs = rawStepAbs;
+  if (stepUnit > 0) {
+    if (stepAbs < stepUnit) stepAbs = stepUnit;
+    var roundedStep = preciseRoundToStep(stepAbs, stepUnit);
+    if (!(roundedStep > 0) || roundedStep + 1e-12 < stepAbs) {
+      roundedStep = preciseCeilToStep(stepAbs, stepUnit);
+    }
+    if (!(roundedStep > 0)) roundedStep = stepUnit;
+    stepAbs = Math.max(stepUnit, roundedStep);
+  }
+  S._gridStepAbs = stepAbs;
+  S._gridStepUnit = stepUnit;
   var centerTarget = price > 0 ? (price - S.skewK * invRatio * stepAbs) : (S.center || 0);
   var drift = price > 0 ? Math.abs((S.center - centerTarget) / price) : 0;
   var driftThreshold = Math.max(0.001, S.gridStepPct / 2);
   var needRecenter = (!S.lastRecenterTs || (now - S.lastRecenterTs > S.recenterEveryMs)) || (drift > driftThreshold);
   if (typeof S.resetCenter !== 'boolean') S.resetCenter = false;
-  if (S.resetCenter && price > 0) { S.center = price; S.lastRecenterTs = now; S.resetCenter = false; }
-  else if (needRecenter) { S.center = centerTarget; S.lastRecenterTs = now; }
+  if (S.resetCenter && price > 0) {
+    S.center = fixPrice(price);
+    S.lastRecenterTs = now;
+    S.resetCenter = false;
+  }
+  else if (needRecenter) {
+    S.center = fixPrice(centerTarget);
+    S.lastRecenterTs = now;
+  }
 
   // ====== Dynamiska min-nivåer (auto + per symbol + override) ======
   var qtyStep = S.qtyStep > 0 ? S.qtyStep : 0.1;
@@ -680,7 +702,11 @@
     console.log('[GRID]', S.role, 'orderförlust – triggar omplanering. Saknar:', missTxt || 'okända id:n');
   }
   S.lastKnownOrders = currentKnownOrders;
-  if (S.forceRecenter) { S.center = centerTarget; S.lastRecenterTs = now2; S.forceRecenter = false; }
+  if (S.forceRecenter) {
+    S.center = fixPrice(centerTarget);
+    S.lastRecenterTs = now2;
+    S.forceRecenter = false;
+  }
   if (S.forceImmediateCycle) cycleDue = true;
 
   if (S.failsafeEnabled && S.openOrdersFailSince > 0 && (now2 - S.openOrdersFailSince > 3 * S.cooldownMs)) {
@@ -1135,9 +1161,10 @@
   if (Number.isFinite(S.center) && S.center > 0) lines.push(makeLine('Rutnätscenter', S.center, S.paused ? '#9aa0b8' : '#78a6ff', 1));
   for (var li=0; li<Math.min(8, orderPlan.levels); li++) {
     var step = (price > 0 ? price : 1) * S.gridStepPct;
+    var chartStep = S._gridStepAbs > 0 ? S._gridStepAbs : step;
     var isNext = li === 0;
-    lines.push(makeLine('Köp nivå ' + (li + 1), S.center - (li + 1) * step, S.paused ? '#295c3a' : (isNext ? '#00ff94' : '#53cf77')));
-    lines.push(makeLine('Sälj nivå ' + (li + 1), S.center + (li + 1) * step, S.paused ? '#6b2d2d' : (isNext ? '#ff5a5a' : '#cf5353')));
+    lines.push(makeLine('Köp nivå ' + (li + 1), S.center - (li + 1) * chartStep, S.paused ? '#295c3a' : (isNext ? '#00ff94' : '#53cf77')));
+    lines.push(makeLine('Sälj nivå ' + (li + 1), S.center + (li + 1) * chartStep, S.paused ? '#6b2d2d' : (isNext ? '#ff5a5a' : '#cf5353')));
   }
   if (be > 0) lines.push(makeLine('Break-even', be, '#ffd166', 3));
   if (liq > 0) lines.push(makeLine('Likvidation', liq, '#ef476f', 3));
@@ -1152,6 +1179,7 @@
     { label: 'Pris', value: (curP).toFixed(6) },
     { label: 'Center', value: S.center.toFixed(6) },
     { label: 'Steg %', value: (S.gridStepPct * 100).toFixed(3) + '%' },
+    { label: 'Steg (abs)', value: (S._gridStepAbs > 0 ? S._gridStepAbs : 0).toFixed(6) },
     { label: 'Nivåer/ben', value: String(orderPlan.levels) },
     { label: 'Dyn minBase(mid)', value: String(S.dynamicMinBase || 0) },
     { label: 'MinQtyEff', value: String(S._minQtyEff || 0) },
@@ -1186,6 +1214,7 @@
   var desiredTotal = Array.isArray(S.lastDesiredShape) ? S.lastDesiredShape.length : 0;
   console.log('[GRID] role=' + S.role + ' status=' + statusTxt + ' p=' + (price>0?price:0).toFixed(6) +
     ' center=' + S.center.toFixed(6) + ' step%=' + (S.gridStepPct*100).toFixed(3) +
+    ' stepAbs=' + (stepAbs > 0 ? stepAbs.toFixed(6) : '0') +
     ' levels=' + orderPlan.levels + ' mål=' + desiredTotal +
     ' minQtyEff=' + minQtyEff + ' minNotEff=' + minNotEff +
     ' dynMinBase=' + dynamicMinBaseMid +
