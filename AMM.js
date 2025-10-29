@@ -23,6 +23,7 @@
   // ====== Defaults ======
   if (typeof S.gridStepPct !== 'number') S.gridStepPct = 0.003;
   if (typeof S.allocPct !== 'number') S.allocPct = 0.05;
+  if (typeof S.midReservePct !== 'number') S.midReservePct = 0.30;
   if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;
   if (typeof S.skewK !== 'number') S.skewK = 0.8;
   if (typeof S.recenterEveryMs !== 'number') S.recenterEveryMs = 60_000;
@@ -200,10 +201,10 @@
   }
 
   var pairForMethod = normalizePairName(pairRaw);
-  var pairLabel = formatPairLabel(pairRaw, S.role) || pairRaw || pairForMethod;
+  var pairDisplay = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
   var pair = pairForMethod;
   if (gb && gb.data && gb.data.pairLedger) {
-    gb.data.pairLedger.customPairLabel = pairLabel;
+    gb.data.pairLedger.customPairLabel = pairDisplay;
   }
 
   function symbolKey() {
@@ -428,14 +429,36 @@
   }
 
   // ====== Center & step ======
-  var stepAbs = (price > 0 ? price : 1) * Math.max(0.0001, S.gridStepPct);
+  var priceRef = price > 0 ? price : 1;
+  var rawStepAbs = priceRef * Math.max(0.0001, S.gridStepPct);
+  var stepUnit = S.priceStep > 0 ? S.priceStep : fallbackTick;
+  if (!(stepUnit > 0)) stepUnit = rawStepAbs > 0 ? rawStepAbs : (priceRef * 0.0001);
+  var stepAbs = rawStepAbs;
+  if (stepUnit > 0) {
+    if (stepAbs < stepUnit) stepAbs = stepUnit;
+    var roundedStep = preciseRoundToStep(stepAbs, stepUnit);
+    if (!(roundedStep > 0) || roundedStep + 1e-12 < stepAbs) {
+      roundedStep = preciseCeilToStep(stepAbs, stepUnit);
+    }
+    if (!(roundedStep > 0)) roundedStep = stepUnit;
+    stepAbs = Math.max(stepUnit, roundedStep);
+  }
+  S._gridStepAbs = stepAbs;
+  S._gridStepUnit = stepUnit;
   var centerTarget = price > 0 ? (price - S.skewK * invRatio * stepAbs) : (S.center || 0);
   var drift = price > 0 ? Math.abs((S.center - centerTarget) / price) : 0;
   var driftThreshold = Math.max(0.001, S.gridStepPct / 2);
   var needRecenter = (!S.lastRecenterTs || (now - S.lastRecenterTs > S.recenterEveryMs)) || (drift > driftThreshold);
   if (typeof S.resetCenter !== 'boolean') S.resetCenter = false;
-  if (S.resetCenter && price > 0) { S.center = price; S.lastRecenterTs = now; S.resetCenter = false; }
-  else if (needRecenter) { S.center = centerTarget; S.lastRecenterTs = now; }
+  if (S.resetCenter && price > 0) {
+    S.center = fixPrice(price);
+    S.lastRecenterTs = now;
+    S.resetCenter = false;
+  }
+  else if (needRecenter) {
+    S.center = fixPrice(centerTarget);
+    S.lastRecenterTs = now;
+  }
 
   // ====== Dynamiska min-nivåer (auto + per symbol + override) ======
   var qtyStep = S.qtyStep > 0 ? S.qtyStep : 0.1;
@@ -517,7 +540,20 @@
 
   // ====== Bygg grid ======
   var levels = Math.max(1, Math.min(orderPlan.levels, 25));
-  var allocQuote = freeMargin() * Math.max(0, Math.min(1, S.allocPct));
+  var freeNow = Math.max(0, freeMargin());
+  var reservePct = Math.max(0, Math.min(0.9, S.midReservePct));
+  var reserveQuote = freeNow * reservePct;
+  var dynamicQuote = Math.max(0, freeNow - reserveQuote);
+  var allocPct = Math.max(0, Math.min(1, S.allocPct));
+  var manualQuote = freeNow * allocPct;
+  var allocQuote = Math.min(freeNow, Math.max(dynamicQuote, manualQuote));
+
+  var skewFactor = Math.max(-1, Math.min(1, invRatio * (Number.isFinite(S.skewK) ? S.skewK : 0)));
+  var bidQuoteShare = Math.max(0, 0.5 * (1 - skewFactor));
+  var askQuoteShare = Math.max(0, 0.5 * (1 + skewFactor));
+  var bidAllocQuote = allocQuote * (bidQuoteShare / Math.max(1e-9, bidQuoteShare + askQuoteShare));
+  var askAllocQuote = allocQuote * (askQuoteShare / Math.max(1e-9, bidQuoteShare + askQuoteShare));
+
   var weights = []; for (var wi=1; wi<=levels; wi++) weights.push(1/wi);
   var wSum = weights.reduce(function(a,b){return a+b;},0);
 
@@ -529,22 +565,25 @@
     var a = fixPrice(S.center + i * stepAbs);
     bids.push(b); asks.push(a);
 
-    var perLevelQuote = allocQuote * (weights[i - 1] / wSum);
-    var baseAmt = perLevelQuote / Math.max(1e-9, (price > 0 ? price : 1));
-    // initial bump mot mid-minima (senare per-order mot faktisk px)
-    var hardMidBase = dynamicMinBaseMid;
+    var weightShare = weights[i - 1] / Math.max(1e-9, wSum);
 
-    if (!Number.isFinite(baseAmt) || baseAmt <= 0) baseAmt = 0;
-    baseAmt = Math.max(baseAmt, hardMidBase, minQtyEff);
+    function computeBaseAmt(sideQuoteAlloc) {
+      var perLevelQuote = sideQuoteAlloc * weightShare;
+      var pxRef = price > 0 ? price : 1;
+      var baseAmtSide = perLevelQuote / Math.max(1e-9, pxRef);
+      var hardMidBase = dynamicMinBaseMid;
 
-    // cap per order mot equity
-    var eqForCap = (S.startEquity > 0 ? S.startEquity : equity());
-    var maxQuote = Math.max(0, eqForCap * (Number.isFinite(S.maxOrderQuotePct)?S.maxOrderQuotePct:0.01));
-    if (maxQuote > 0 && toQuote(price, baseAmt) > maxQuote) baseAmt = maxQuote / Math.max(1e-9, price);
-    baseAmt = preciseRoundToStep(baseAmt, qtyStep);
+      if (!Number.isFinite(baseAmtSide) || baseAmtSide <= 0) baseAmtSide = 0;
+      baseAmtSide = Math.max(baseAmtSide, hardMidBase, minQtyEff);
 
-    sizeBaseB.push(baseAmt);
-    sizeBaseA.push(baseAmt);
+      var eqForCap = (S.startEquity > 0 ? S.startEquity : equity());
+      var maxQuote = Math.max(0, eqForCap * (Number.isFinite(S.maxOrderQuotePct)?S.maxOrderQuotePct:0.01));
+      if (maxQuote > 0 && toQuote(price, baseAmtSide) > maxQuote) baseAmtSide = maxQuote / Math.max(1e-9, price);
+      return preciseRoundToStep(baseAmtSide, qtyStep);
+    }
+
+    sizeBaseB.push(computeBaseAmt(bidAllocQuote));
+    sizeBaseA.push(computeBaseAmt(askAllocQuote));
   }
 
   // ====== Throttle/toleranser ======
@@ -663,7 +702,11 @@
     console.log('[GRID]', S.role, 'orderförlust – triggar omplanering. Saknar:', missTxt || 'okända id:n');
   }
   S.lastKnownOrders = currentKnownOrders;
-  if (S.forceRecenter) { S.center = centerTarget; S.lastRecenterTs = now2; S.forceRecenter = false; }
+  if (S.forceRecenter) {
+    S.center = fixPrice(centerTarget);
+    S.lastRecenterTs = now2;
+    S.forceRecenter = false;
+  }
   if (S.forceImmediateCycle) cycleDue = true;
 
   if (S.failsafeEnabled && S.openOrdersFailSince > 0 && (now2 - S.openOrdersFailSince > 3 * S.cooldownMs)) {
@@ -729,7 +772,11 @@
       'open=' + oo.length,
       'mål=' + desired.length,
       'minQtyEff=' + minQtyEff, 'minNotEff=' + minNotEff,
-      'dynMinBase=' + dynamicMinBaseMid
+      'dynMinBase=' + dynamicMinBaseMid,
+      'gridBudget=' + allocQuote.toFixed(4),
+      'reserved=' + reserveQuote.toFixed(4),
+      'bidBudget=' + bidAllocQuote.toFixed(4),
+      'askBudget=' + askAllocQuote.toFixed(4)
     );
 
     if (desired.length === 0) {
@@ -1114,9 +1161,10 @@
   if (Number.isFinite(S.center) && S.center > 0) lines.push(makeLine('Rutnätscenter', S.center, S.paused ? '#9aa0b8' : '#78a6ff', 1));
   for (var li=0; li<Math.min(8, orderPlan.levels); li++) {
     var step = (price > 0 ? price : 1) * S.gridStepPct;
+    var chartStep = S._gridStepAbs > 0 ? S._gridStepAbs : step;
     var isNext = li === 0;
-    lines.push(makeLine('Köp nivå ' + (li + 1), S.center - (li + 1) * step, S.paused ? '#295c3a' : (isNext ? '#00ff94' : '#53cf77')));
-    lines.push(makeLine('Sälj nivå ' + (li + 1), S.center + (li + 1) * step, S.paused ? '#6b2d2d' : (isNext ? '#ff5a5a' : '#cf5353')));
+    lines.push(makeLine('Köp nivå ' + (li + 1), S.center - (li + 1) * chartStep, S.paused ? '#295c3a' : (isNext ? '#00ff94' : '#53cf77')));
+    lines.push(makeLine('Sälj nivå ' + (li + 1), S.center + (li + 1) * chartStep, S.paused ? '#6b2d2d' : (isNext ? '#ff5a5a' : '#cf5353')));
   }
   if (be > 0) lines.push(makeLine('Break-even', be, '#ffd166', 3));
   if (liq > 0) lines.push(makeLine('Likvidation', liq, '#ef476f', 3));
@@ -1131,11 +1179,17 @@
     { label: 'Pris', value: (curP).toFixed(6) },
     { label: 'Center', value: S.center.toFixed(6) },
     { label: 'Steg %', value: (S.gridStepPct * 100).toFixed(3) + '%' },
+    { label: 'Steg (abs)', value: (S._gridStepAbs > 0 ? S._gridStepAbs : 0).toFixed(6) },
     { label: 'Nivåer/ben', value: String(orderPlan.levels) },
     { label: 'Dyn minBase(mid)', value: String(S.dynamicMinBase || 0) },
     { label: 'MinQtyEff', value: String(S._minQtyEff || 0) },
     { label: 'MinNotEff(USDT)', value: String(S._minNotEff || 0) },
     { label: 'Allokering %', value: (S.allocPct * 100).toFixed(0) + '%' },
+    { label: 'Gridbudget (USDT)', value: allocQuote.toFixed(2) },
+    { label: 'Reserv mitt %', value: (reservePct * 100).toFixed(0) + '%' },
+    { label: 'Reserv mitt (USDT)', value: reserveQuote.toFixed(2) },
+    { label: 'Budgetsida köp', value: bidAllocQuote.toFixed(2) },
+    { label: 'Budgetsida sälj', value: askAllocQuote.toFixed(2) },
     { label: 'Hävarm', value: String(lev) + 'x' },
     { label: 'Plånbok', value: (Number.isFinite(wallet) ? wallet : 0).toFixed(2) },
     { label: 'Eget kapital (nu)', value: (curEq).toFixed(2) },
@@ -1160,8 +1214,13 @@
   var desiredTotal = Array.isArray(S.lastDesiredShape) ? S.lastDesiredShape.length : 0;
   console.log('[GRID] role=' + S.role + ' status=' + statusTxt + ' p=' + (price>0?price:0).toFixed(6) +
     ' center=' + S.center.toFixed(6) + ' step%=' + (S.gridStepPct*100).toFixed(3) +
+    ' stepAbs=' + (stepAbs > 0 ? stepAbs.toFixed(6) : '0') +
     ' levels=' + orderPlan.levels + ' mål=' + desiredTotal +
     ' minQtyEff=' + minQtyEff + ' minNotEff=' + minNotEff +
-    ' dynMinBase=' + dynamicMinBaseMid
+    ' dynMinBase=' + dynamicMinBaseMid +
+    ' gridBudget=' + allocQuote.toFixed(4) +
+    ' reserved=' + reserveQuote.toFixed(4) +
+    ' bidBudget=' + bidAllocQuote.toFixed(4) +
+    ' askBudget=' + askAllocQuote.toFixed(4)
   );
 })();
