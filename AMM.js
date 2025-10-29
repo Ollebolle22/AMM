@@ -883,19 +883,19 @@
   }
 
   // ====== Orderläggning ======
-  var desired = null;
+  var desiredOrders = null;
   if (cycleDue && !S.paused && !apiUnstable) {
     if (!S.trimThrottle || typeof S.trimThrottle !== 'object') S.trimThrottle = {};
     var trimThrottle = S.trimThrottle;
     var trimExpiry = Math.max(orderPlan.trimCooldownMs * 4, 120_000);
     for (var key in trimThrottle) if (!Number.isFinite(trimThrottle[key]) || now2 - trimThrottle[key] > trimExpiry) delete trimThrottle[key];
 
-    desired = [];
+    desiredOrders = [];
     function pushDesired(side, px, amt, tag) {
       if (!Number.isFinite(px) || px <= 0) return;
       if (!Number.isFinite(amt) || amt <= 0) return;
-      for (var d of desired) if (d.side === side && Math.abs(d.px - px) <= matchTolerance) return;
-      desired.push({ side: side, px: px, amt: amt, matched: false, tag: tag });
+      for (var d of desiredOrders) if (d.side === side && Math.abs(d.px - px) <= matchTolerance) return;
+      desiredOrders.push({ side: side, px: px, amt: amt, matched: false, tag: tag });
     }
 
     // Trim-avstånd
@@ -926,7 +926,7 @@
     console.log('[GRID]', S.role, 'cykelstart',
       'pris=' + Number(price || 0).toFixed(6),
       'open=' + oo.length,
-      'mål=' + desired.length,
+      'mål=' + desiredOrders.length,
       'minQtyEff=' + minQtyEff, 'minNotEff=' + minNotEff,
       'dynMinBase=' + dynamicMinBaseMid,
       'gridBudget=' + allocQuote.toFixed(4),
@@ -935,7 +935,7 @@
       'askBudget=' + askAllocQuote.toFixed(4)
     );
 
-    if (desired.length === 0) {
+    if (desiredOrders.length === 0) {
       console.log('[GRID]', S.role, 'inga planerade order i denna cykel – alla nivåer uppfyllda eller budget=0');
     }
 
@@ -967,13 +967,13 @@
 
     function findWithinTolerance(side, rate){
       if (!Number.isFinite(rate) || rate <= 0) return null;
-      for (var d of desired) { if (!d.matched && d.side === side && Math.abs(rate - d.px) <= matchTolerance) return d; }
+      for (var d of desiredOrders) { if (!d.matched && d.side === side && Math.abs(rate - d.px) <= matchTolerance) return d; }
       return null;
     }
     function findClosestTarget(side, rate){
       if (!Number.isFinite(rate) || rate <= 0) return null;
       var best = null; var bestDist = Infinity;
-      for (var d of desired) {
+      for (var d of desiredOrders) {
         if (d.matched || d.side !== side) continue;
         var dist = Math.abs(rate - d.px);
         if (dist < bestDist) { bestDist = dist; best = d; }
@@ -1237,7 +1237,7 @@
     var maxAdd = Math.max(1, Math.min(orderPlan.maxPerCycle, orderPlan.maxActive));
     var added = 0; var addedSide = { buy: 0, sell: 0 };
 
-    var missing = desired.filter(function(d){ return !d.matched; });
+    var missing = desiredOrders.filter(function(d){ return !d.matched; });
     var coalesce = [];
     for (var d2 of missing) {
       var hit = coalesce.find(function(x){ return x.side === d2.side && Math.abs(x.px - d2.px) <= matchTolerance; });
@@ -1247,7 +1247,7 @@
     if (missing.length) {
       console.log('[GRID]', S.role, 'saknar', missing.length, 'mål -> försöker lägga');
     } else {
-      console.log('[GRID]', S.role, 'inga nya order behövs – alla', desired.length, 'mål matchade av befintliga order');
+      console.log('[GRID]', S.role, 'inga nya order behövs – alla', desiredOrders.length, 'mål matchade av befintliga order');
     }
 
     var eqNow2 = equity();
@@ -1281,7 +1281,7 @@
       console.log('[GRID]', S.role, 'cykel klar utan nya order – alla mål redan täckta');
     }
 
-    S.lastDesiredShape = desired.map(function(d){ return { side: d.side, px: d.px }; });
+    S.lastDesiredShape = desiredOrders.map(function(d){ return { side: d.side, px: d.px }; });
     S.lastCycleTs = now2; S.forceImmediateCycle = false;
   } else if (cycleDue) {
     var cycleSkip = [];
