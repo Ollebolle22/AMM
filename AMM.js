@@ -249,7 +249,14 @@
     if (typeof opts.whatstrat !== 'string' || !opts.whatstrat.length) {
       opts.whatstrat = defaultWhatstrat();
     }
-    args.push(opts);
+    var expected = Number.isFinite(fn.length) ? fn.length : 0;
+    if (!(expected > 0)) expected = args.length + 1;
+    if (expected <= args.length) {
+      args.push(opts);
+    } else {
+      while (args.length < expected - 1) args.push(null);
+      args.push(opts);
+    }
     return fn.apply(gb.method, args);
   }
 
