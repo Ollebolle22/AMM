@@ -273,8 +273,9 @@
   }
 
   var pairForMethod = normalizePairName(pairRaw);
-  var pairLabel = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
-  var pair = pairRaw && pairRaw.length ? pairRaw : pairForMethod;
+  var pairDisplay = pairRaw && pairRaw.length ? pairRaw : (formatPairLabel(pairRaw, S.role) || pairForMethod);
+  var pair = pairForMethod;
+  var pairDebugLabel = pairDisplay && pairDisplay.length ? pairDisplay : pair;
   if (gb && gb.data && gb.data.pairLedger) {
     gb.data.pairLedger.customPairLabel = pairDisplay;
   }
@@ -810,10 +811,14 @@
   var prevPauseKey = (S.paused ? S.lastPauseReason : '');
   var changed = prevPauseKey !== pauseReason;
   if (pauseReason) {
+    if (changed) {
+      console.log('[GRID]', S.role, 'failsafe aktiverad –', pauseReason, 'eq=', equity().toFixed(4), 'fm=', freeMargin().toFixed(4), 'pair=', pairDebugLabel);
+    }
     if (!S.paused || changed) { S.paused = true; S.lastPauseReason = pauseReason;
       gb.data.pairLedger.notifications = [{ text: 'FAILSAFE: ' + pauseReason + '. Pausar order.', variant: 'error', persist: false }]; }
   } else if (S.paused) {
     S.paused = false; S.lastPauseReason = '';
+    console.log('[GRID]', S.role, 'failsafe hävd – återupptar orderläggning. eq=', equity().toFixed(4), 'fm=', freeMargin().toFixed(4));
     gb.data.pairLedger.notifications = [{ text: 'Failsafe avklarad. Återupptar.', variant: 'success', persist: false }];
   }
 
@@ -874,11 +879,28 @@
       console.log('[GRID]', S.role, 'inga planerade order i denna cykel – alla nivåer uppfyllda eller budget=0');
     }
 
-    var replaceMethodName =
-      (gb.method && typeof gb.method.replaceOrder === 'function') ? 'replaceOrder' :
-      (gb.method && typeof gb.method.amendOrder   === 'function') ? 'amendOrder'   :
-      (gb.method && typeof gb.method.editOrder    === 'function') ? 'editOrder'    : '';
+    var replaceCandidates = [
+      'replaceOrder',
+      'amendOrder',
+      'amendActiveOrder',
+      'amendLinearOrder',
+      'modifyOrder',
+      'updateOrder',
+      'editOrder'
+    ];
+    var replaceMethodName = '';
+    for (var rci = 0; rci < replaceCandidates.length; rci++) {
+      var cand = replaceCandidates[rci];
+      if (gb.method && typeof gb.method[cand] === 'function') { replaceMethodName = cand; break; }
+    }
     var canReplace = Boolean(replaceMethodName);
+    if (!canReplace && !S._loggedReplaceMissing) {
+      S._loggedReplaceMissing = true;
+      console.log('[GRID]', S.role, 'kan inte amend/replace order – inget API-stöd hittat. Faller tillbaka till cancel+ny.');
+    } else if (canReplace && S._loggedReplaceMissing) {
+      S._loggedReplaceMissing = false;
+      console.log('[GRID]', S.role, 'hittade ersättningsmetod', replaceMethodName, '– kommer amend:a befintliga order.');
+    }
     var maxReplacesPerCycle = (Number.isFinite(orderPlan.maxReplacesPerCycle) && orderPlan.maxReplacesPerCycle > 0)
       ? orderPlan.maxReplacesPerCycle : orderPlan.maxPerCycle || Infinity;
     var replacedThisCycle = 0;
@@ -1042,8 +1064,13 @@
       if (!Number.isFinite(q) || q <= 0) return false;
       var qOk = preciseRoundToStep(q, qtyStep);
       var pxOk = fixPrice(target.px);
+      var reduceOnlyTarget = !!(target.tag && String(target.tag).indexOf('|RO') >= 0);
       try {
-        await callWithTimeout(safePromise(function(){ return gb.method[replaceMethodName](id, qOk, pxOk, pair, ex); }), S.localOrderTimeoutMs, 'replace order');
+        var prevRate = rateFromOrder(order) || 0;
+        var callArgs = [id, qOk, pxOk, pair, ex];
+        if (reduceOnlyTarget) callArgs.push({ reduceOnly: true });
+        console.log('[GRID]', S.role, 'amend', replaceMethodName, 'id=', id, 'från', Number(prevRate || 0).toFixed(6), 'till', pxOk.toFixed(6), 'qty', qOk, reduceOnlyTarget ? '(RO)' : '');
+        await callWithTimeout(safePromise(function(){ return gb.method[replaceMethodName].apply(gb.method, callArgs); }), S.localOrderTimeoutMs, 'replace order');
         clearApiFailure();
         target.matched = true; replacedThisCycle++;
         console.log('[GRID]', S.role, 'replaced', sideFromOrder(order), qOk, '@', pxOk);
@@ -1102,7 +1129,12 @@
       }
       if (!handled) {
         if (S.apiBackoffUntil > Date.now()) break;
-        await cancelOne(o);
+        if (!canReplace) {
+          console.log('[GRID]', S.role, 'ingen amend-metod – avbryter order för att lägga ny @', target ? target.px : rate);
+          await cancelOne(o);
+        } else {
+          console.log('[GRID]', S.role, 'amend misslyckades – behåller order och försöker igen senare. id=', idFromOrder(o) || '-');
+        }
         if (S.apiBackoffUntil > Date.now()) break;
       }
     }
@@ -1320,6 +1352,8 @@
     ' gridBudget=' + allocQuote.toFixed(4) +
     ' reserved=' + reserveQuote.toFixed(4) +
     ' bidBudget=' + bidAllocQuote.toFixed(4) +
-    ' askBudget=' + askAllocQuote.toFixed(4)
+    ' askBudget=' + askAllocQuote.toFixed(4) +
+    ' kontrakt=' + contractLabel +
+    ' perp=' + ((contractInfo.isPerp === false) ? 'NEJ' : (contractInfo.isPerp === true ? 'JA' : 'okänd'))
   );
 })();
