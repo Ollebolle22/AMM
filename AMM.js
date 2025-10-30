@@ -246,14 +246,10 @@
     var fn = gb.method[name];
     var args = Array.isArray(baseArgs) ? baseArgs.slice() : [];
 
-    var expected = Number.isFinite(fn.length) ? fn.length : 0;
-    if (expected > 0 && expected - 1 > args.length) {
-      while (args.length < expected - 1) args.push(null);
-    }
-
     var opts = buildOrderOptions(options);
     args.push(opts);
 
+    var expected = Number.isFinite(fn.length) ? fn.length : 0;
     var expectsCallback = expected > 0 && expected > args.length;
 
     if (!expectsCallback) {
@@ -1012,6 +1008,229 @@
       return best;
     }
 
+    function stringIndicatesFailure(str) {
+      if (typeof str !== 'string') return false;
+      var lowered = str.trim().toLowerCase();
+      if (!lowered.length) return false;
+      if (stringIndicatesSuccess(lowered)) return false;
+      var failureHints = [
+        'error', 'fail', 'failed', 'denied', 'insufficient', 'insuff', 'reject', 'rejected', 'exceed', 'exceeded',
+        'not enough', 'not_enough', 'not allow', 'not_allowed', 'not permitted', 'forbid', 'forbidden',
+        'invalid', 'cancelled', 'canceled', 'timeout', 'timed out', 'too many', 'exhausted', 'limit reached',
+        'unable', 'missing', 'not support', 'not supported', 'not available', 'maintenance', 'system busy', 'risk limit'
+      ];
+      for (var j = 0; j < failureHints.length; j++) {
+        if (lowered.indexOf(failureHints[j]) >= 0) return true;
+      }
+      return false;
+    }
+
+    function stringIndicatesSuccess(str) {
+      if (typeof str !== 'string') return false;
+      var lowered = str.trim().toLowerCase();
+      if (!lowered.length) return false;
+      var successHints = [
+        'ok', 'success', 'succeeded', 'filled', 'created', 'done', 'placed', 'ack', 'acknowledged', 'accepted',
+        'submitted', 'complete', 'completed', 'new', 'true', 'good', 'received', 'processing', 'pending', 'queued'
+      ];
+      for (var i = 0; i < successHints.length; i++) {
+        if (lowered === successHints[i]) return true;
+      }
+      if (lowered.indexOf('success') >= 0 && lowered.indexOf('successfully') >= 0) return true;
+      if (lowered === '0') return true;
+      return false;
+    }
+
+    function interpretCodeField(field, value) {
+      if (typeof value === 'undefined' || value === null) return 'unknown';
+      if (typeof value === 'boolean') return value ? 'success' : 'failure';
+      if (typeof value === 'number') {
+        if (field === 'code' && value >= 200 && value < 300) return 'success';
+        return value === 0 ? 'success' : 'failure';
+      }
+      if (typeof value === 'string') {
+        var trimmed = value.trim();
+        if (!trimmed.length) return 'unknown';
+        var lowered = trimmed.toLowerCase();
+        if (lowered === '0' || lowered === 'ok' || lowered === 'success') return 'success';
+        if (field === 'code') {
+          var num = Number(trimmed);
+          if (Number.isFinite(num)) {
+            if (num >= 200 && num < 300) return 'success';
+            return num === 0 ? 'success' : 'failure';
+          }
+        } else {
+          var num2 = Number(trimmed);
+          if (Number.isFinite(num2)) return num2 === 0 ? 'success' : 'failure';
+        }
+        if (lowered === 'false') return 'failure';
+        if (stringIndicatesFailure(lowered)) return 'failure';
+        return 'unknown';
+      }
+      return 'unknown';
+    }
+
+    function analyzePlacementOutcome(value) {
+      var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+      var maxDepth = 6;
+      var outcome = { success: false, failure: false, failureReason: null, successReason: null };
+
+      function markSuccess(reason) {
+        if (!outcome.success) outcome.success = true;
+        if (!outcome.successReason && reason) outcome.successReason = reason;
+      }
+
+      function markFailure(reason) {
+        if (!outcome.failure) outcome.failure = true;
+        if (!outcome.failureReason && reason) outcome.failureReason = reason;
+      }
+
+      function inspect(current, depth, pathKey) {
+        if (depth > maxDepth) return;
+        if (current === null || typeof current === 'undefined') return;
+        if (current === true) { markSuccess(pathKey ? pathKey + '=true' : 'boolean-true'); return; }
+        if (current === false) { markFailure(pathKey ? pathKey + '=false' : 'boolean-false'); return; }
+        if (typeof current === 'string') {
+          var trimmed = current.trim();
+          if (!trimmed.length) return;
+          if (stringIndicatesFailure(trimmed)) { markFailure(pathKey ? pathKey + '=' + trimmed : trimmed); return; }
+          if (stringIndicatesSuccess(trimmed)) { markSuccess(pathKey ? pathKey + '=' + trimmed : trimmed); return; }
+          return;
+        }
+        if (typeof current === 'number') {
+          if (current === 0) { markSuccess(pathKey ? pathKey + '=0' : 'number-0'); return; }
+          return;
+        }
+        if (Array.isArray(current)) {
+          for (var i = 0; i < current.length; i++) {
+            if (outcome.failure) break;
+            inspect(current[i], depth + 1, pathKey);
+          }
+          return;
+        }
+        if (typeof current === 'object') {
+          if (seen) {
+            if (seen.has(current)) return;
+            seen.add(current);
+          }
+          var orderIdFields = ['orderId', 'order_id', 'orderID', 'id', 'orderLinkId', 'order_link_id', 'clientOrderId', 'client_order_id', 'clOrdID', 'orderIdStr', 'order_id_str'];
+          for (var o = 0; o < orderIdFields.length; o++) {
+            var oidKey = orderIdFields[o];
+            if (!Object.prototype.hasOwnProperty.call(current, oidKey)) continue;
+            var oidVal = current[oidKey];
+            if (typeof oidVal === 'string' && oidVal.trim().length) { markSuccess(oidKey + '=' + oidVal); }
+            else if (typeof oidVal === 'number' && oidVal !== 0) { markSuccess(oidKey + '=' + String(oidVal)); }
+          }
+
+          var codeFields = ['retCode', 'ret_code', 'code', 'errorCode', 'error_code', 'err_code', 'errno', 'statusCode', 'status_code', 'retcode'];
+          for (var j = 0; j < codeFields.length; j++) {
+            var key = codeFields[j];
+            if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
+            var verdict = interpretCodeField(key, current[key]);
+            if (verdict === 'failure') markFailure(key + '=' + String(current[key]));
+            else if (verdict === 'success') markSuccess(key + '=' + String(current[key]));
+          }
+
+          var boolFields = ['success', 'succeeded', 'isSuccess', 'is_success', 'ok', 'retSuccess', 'ret_success', 'result'];
+          for (var k = 0; k < boolFields.length; k++) {
+            var bKey = boolFields[k];
+            if (!Object.prototype.hasOwnProperty.call(current, bKey)) continue;
+            var bVal = current[bKey];
+            if (typeof bVal === 'boolean') {
+              if (bVal) markSuccess(bKey + '=true'); else markFailure(bKey + '=false');
+            } else if (typeof bVal === 'string') {
+              var bTrim = bVal.trim();
+              if (!bTrim.length) continue;
+              var bLower = bTrim.toLowerCase();
+              if (bLower === 'false') markFailure(bKey + '=false');
+              else if (stringIndicatesFailure(bTrim)) markFailure(bKey + '=' + bTrim);
+              else if (stringIndicatesSuccess(bTrim) || bLower === 'true' || bLower === '1') markSuccess(bKey + '=' + bTrim);
+            }
+          }
+
+          var statusFields = ['status', 'state', 'orderStatus', 'order_status', 'retMsg', 'ret_msg', 'msg', 'message', 'desc', 'description'];
+          for (var s = 0; s < statusFields.length; s++) {
+            var sKey = statusFields[s];
+            if (!Object.prototype.hasOwnProperty.call(current, sKey)) continue;
+            var sVal = current[sKey];
+            if (typeof sVal === 'string') {
+              var sTrim = sVal.trim();
+              if (!sTrim.length) continue;
+              if (stringIndicatesFailure(sTrim)) markFailure(sKey + '=' + sTrim);
+              else if (stringIndicatesSuccess(sTrim)) markSuccess(sKey + '=' + sTrim);
+            }
+          }
+
+          var keys = Object.keys(current);
+          for (var m = 0; m < keys.length; m++) {
+            if (outcome.failure) break;
+            var keyName = keys[m];
+            var child = current[keyName];
+            inspect(child, depth + 1, keyName);
+          }
+          return;
+        }
+      }
+
+      inspect(value, 0, '');
+      if (outcome.failure) outcome.success = false;
+      if (!outcome.success && !outcome.failure) {
+        outcome.failure = true;
+        if (!outcome.failureReason) outcome.failureReason = 'no-success-indicator';
+      }
+      return outcome;
+    }
+
+    function extractErrorMessage(value) {
+      if (typeof value === 'string') {
+        var trimmed = value.trim();
+        return trimmed.length ? trimmed : null;
+      }
+      if (typeof value === 'number') {
+        return value !== 0 ? String(value) : null;
+      }
+      if (!value || typeof value !== 'object') return null;
+      var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+      var priority = ['retMsg', 'ret_msg', 'msg', 'message', 'desc', 'description', 'reason', 'error', 'errorMessage', 'errorMsg', 'error_msg', 'info', 'detail', 'details'];
+      var maxDepth = 6;
+      function search(current, depth) {
+        if (depth > maxDepth || current === null || typeof current === 'undefined') return null;
+        if (typeof current === 'string') {
+          var txt = current.trim();
+          return txt.length ? txt : null;
+        }
+        if (typeof current === 'number') return current !== 0 ? String(current) : null;
+        if (Array.isArray(current)) {
+          for (var i = 0; i < current.length; i++) {
+            var found = search(current[i], depth + 1);
+            if (found) return found;
+          }
+          return null;
+        }
+        if (typeof current === 'object') {
+          if (seen) {
+            if (seen.has(current)) return null;
+            seen.add(current);
+          }
+          for (var p = 0; p < priority.length; p++) {
+            var key = priority[p];
+            if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
+            var val = search(current[key], depth + 1);
+            if (val) return val;
+          }
+          var keys = Object.keys(current);
+          for (var j = 0; j < keys.length; j++) {
+            var keyName = keys[j];
+            if (priority.indexOf(keyName) >= 0) continue;
+            var val2 = search(current[keyName], depth + 1);
+            if (val2) return val2;
+          }
+        }
+        return null;
+      }
+      return search(value, 0);
+    }
+
     function placeLimit(side, qtyL, pxL, reduceOnly, postOnly) {
       var baseOpts = {};
       if (reduceOnly) baseOpts.reduceOnly = true;
@@ -1130,26 +1349,26 @@
 
         var res = await callWithTimeout(safePromise(function(){ return placeLimit(side, amtOk, pxOk, reduceOnly, S.usePostOnly); }), S.localOrderTimeoutMs, 'place order');
 
-        var ok = false;
-        if (res) {
-          if (res.orderId || res.id || res.clientOrderId || res.client_order_id) ok = true;
-          if (!ok && res.result && typeof res.result === 'object') {
-            var rres = res.result;
-            if (rres.orderId || rres.order_id || rres.orderID || rres.id || rres.orderLinkId || rres.order_link_id) ok = true;
-          }
-          if (!ok && res.data && typeof res.data === 'object') {
-            var dres = res.data;
-            if (dres.orderId || dres.order_id || dres.orderID || dres.id || dres.orderLinkId || dres.order_link_id) ok = true;
-          }
-          if (res.success === true || res.success === 'success' || res.success === 'ok') ok = true;
-          if (!ok && typeof res.retCode !== 'undefined') ok = (Number(res.retCode) === 0 || String(res.retCode) === '0');
-          if (!ok && typeof res.ret_code !== 'undefined') ok = (Number(res.ret_code) === 0 || String(res.ret_code) === '0');
-          if (!ok && typeof res.retMsg === 'string' && res.retMsg.toLowerCase() === 'ok') ok = true;
-        }
+        var outcome = analyzePlacementOutcome(res);
+        var ok = outcome.success;
         if (!ok) {
-          var errMsg = (res && (res.retMsg || res.msg || res.message)) ? (res.retMsg || res.msg || res.message) : null;
-          console.log('[GRID] place returned error-ish response', side, pxOk, { amtOk: amtOk, minQtyEff: minQtyEff, minNotEff: minNotEff }, errMsg ? 'err=' + errMsg : '', '\nresp=', res);
-          if (errMsg && shouldBackoff({ message: errMsg })) markApiFailure({ message: errMsg });
+          var errMsg = extractErrorMessage(res);
+          var extraInfo = [];
+          if (outcome.failureReason) extraInfo.push('reason=' + outcome.failureReason);
+          else extraInfo.push('reason=no-success-indicator');
+          if (errMsg && errMsg !== outcome.failureReason) extraInfo.push('err=' + errMsg);
+          var extraTxt = extraInfo.length ? extraInfo.join(' ') : '';
+          console.log('[GRID] place returned error-ish response', side, pxOk, { amtOk: amtOk, minQtyEff: minQtyEff, minNotEff: minNotEff }, extraTxt, '\nresp=', res);
+          var failObj = null;
+          var shouldBackoffFlag = false;
+          if (outcome.failure) {
+            failObj = { message: outcome.failureReason || (errMsg || 'order placement failure') };
+            shouldBackoffFlag = shouldBackoff(failObj);
+          } else if (errMsg) {
+            var errObj = { message: errMsg };
+            if (shouldBackoff(errObj)) { failObj = errObj; shouldBackoffFlag = true; }
+          }
+          if (failObj && shouldBackoffFlag) markApiFailure(failObj);
           return false;
         }
 
