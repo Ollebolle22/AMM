@@ -26,6 +26,13 @@
   if (typeof S.midReservePct !== 'number') S.midReservePct = 0.30;
   if (typeof S.invMaxPct !== 'number') S.invMaxPct = 0.12;
   if (typeof S.skewK !== 'number') S.skewK = 0.8;
+  if (typeof S.autoConfigEnabled !== 'boolean') S.autoConfigEnabled = true;
+  if (typeof S.autoGridStep !== 'boolean') S.autoGridStep = true;
+  if (typeof S.autoSkew !== 'boolean') S.autoSkew = true;
+  if (typeof S.autoAlloc !== 'boolean') S.autoAlloc = true;
+  if (typeof S.autoLevels !== 'boolean') S.autoLevels = true;
+  if (typeof S.feeBufferMultiplier !== 'number') S.feeBufferMultiplier = 1.2;
+  if (typeof S.targetOrderNotional !== 'number') S.targetOrderNotional = 0;
   if (typeof S.recenterEveryMs !== 'number') S.recenterEveryMs = 60_000;
   if (typeof S.cancelTolerancePct !== 'number') S.cancelTolerancePct = 0.20 / 100;
   if (typeof S.replaceTriggerPct !== 'number') S.replaceTriggerPct = Math.max(S.gridStepPct * 0.5, S.cancelTolerancePct * 1.5);
@@ -126,6 +133,83 @@
 
   // Nu kan vi tryggt kolla hasTickStep med våra (ev. uppdaterade) värden:
   var hasTickStep = (marketTick > 0 && marketQtyStep > 0);
+
+  function clamp(val, min, max) {
+    if (!Number.isFinite(val)) return min;
+    if (Number.isFinite(min) && val < min) return min;
+    if (Number.isFinite(max) && val > max) return max;
+    return val;
+  }
+
+  function extractVolatility(data) {
+    var ticker = data && data.ticker ? data.ticker : {};
+    var values = [];
+    var addPct = function (v) {
+      var num = Number(v);
+      if (Number.isFinite(num)) values.push(Math.abs(num) / 100);
+    };
+    addPct(ticker.percentChange);
+    addPct(ticker.priceChangePercent);
+    addPct(ticker.priceChangePcnt);
+    var high = Number(ticker.high) || Number(ticker.highPrice) || Number(ticker.high24h) || 0;
+    var low = Number(ticker.low) || Number(ticker.lowPrice) || Number(ticker.low24h) || 0;
+    if (high > 0 && low > 0 && high > low) {
+      var mid = (high + low) / 2;
+      if (mid > 0) values.push((high - low) / mid);
+    }
+    if (!values.length) {
+      var stats = data && data.stats24h ? data.stats24h : {};
+      addPct(stats.priceChangePercent);
+      var high2 = Number(stats.highPrice) || 0;
+      var low2 = Number(stats.lowPrice) || 0;
+      if (high2 > 0 && low2 > 0 && high2 > low2) {
+        var mid2 = (high2 + low2) / 2;
+        if (mid2 > 0) values.push((high2 - low2) / mid2);
+      }
+    }
+    if (!values.length) return 0.01;
+    values.sort(function (a, b) { return a - b; });
+    return clamp(values[Math.floor(values.length / 2)] || values[0], 0.001, 0.15);
+  }
+
+  function extractFeeRates(data) {
+    var marketInfo = data && data.market ? data.market : {};
+    var feeCandidates = [];
+    function add(val) {
+      var num = Number(val);
+      if (Number.isFinite(num) && num >= 0) feeCandidates.push(num);
+    }
+    add(marketInfo.makerFee);
+    add(marketInfo.maker_fee);
+    add(marketInfo.makerCommission);
+    add(marketInfo.makerCommissionRate);
+    add(marketInfo.makerCommissionRateBuy);
+    add(marketInfo.makerCommissionRateSell);
+    if (marketInfo.feeRates && typeof marketInfo.feeRates === 'object') {
+      add(marketInfo.feeRates.maker);
+      add(marketInfo.feeRates.makerRate);
+      add(marketInfo.feeRates.maker_fee);
+    }
+    var maker = feeCandidates.length ? feeCandidates[0] : 0.0002;
+
+    var takerCandidates = [];
+    function addTaker(val) {
+      var num = Number(val);
+      if (Number.isFinite(num) && num >= 0) takerCandidates.push(num);
+    }
+    addTaker(marketInfo.takerFee);
+    addTaker(marketInfo.taker_fee);
+    addTaker(marketInfo.takerCommission);
+    addTaker(marketInfo.takerCommissionRate);
+    if (marketInfo.feeRates && typeof marketInfo.feeRates === 'object') {
+      addTaker(marketInfo.feeRates.taker);
+      addTaker(marketInfo.feeRates.takerRate);
+      addTaker(marketInfo.feeRates.taker_fee);
+    }
+    var taker = takerCandidates.length ? takerCandidates[0] : Math.max(maker, 0.0006);
+
+    return { maker: maker, taker: taker };
+  }
 
   // Startvakt: kräv bara pris; tick/step får fallback
   if (!priceOk0) {
@@ -363,7 +447,10 @@
   var pair = pairForMethod;
   var pairDebugLabel = pairDisplay && pairDisplay.length ? pairDisplay : pair;
   if (gb && gb.data && gb.data.pairLedger) {
-    gb.data.pairLedger.customPairLabel = pairDisplay;
+    var iconLabel = '🤖⚖️ ' + (pairDisplay && pairDisplay.length ? pairDisplay : pair);
+    gb.data.pairLedger.customPairLabel = iconLabel;
+    gb.data.pairLedger.customStatusIcon = S.paused ? '⏸️' : '🟢';
+    gb.data.pairLedger.customSubLabel = '📊 Auto-grid aktiv';
   }
 
   function symbolKey() {
@@ -508,6 +595,60 @@
     var timeout = new Promise(function(_, reject){ timer = setTimeout(function(){ reject(timeoutErr); }, Math.max(1, ms)); });
     try { return await Promise.race([promise, timeout]); }
     finally { if (timer) clearTimeout(timer); }
+  }
+
+  function applyAutoParameters(ctx) {
+    if (!S.autoConfigEnabled || !ctx || !(ctx.price > 0)) return;
+    var plan = S.orderPlan || {};
+    var volatility = clamp(ctx.volatility || 0.01, 0.001, 0.2);
+    var tickPct = ctx.tick > 0 ? ctx.tick / ctx.price : 0.0005;
+    var freeMarginQuote = Math.max(0, ctx.freeMargin || 0);
+    var minNotional = Math.max(ctx.minNotional || 0, ctx.price * Math.max(ctx.minQty || 0, 0));
+
+    if (S.autoLevels) {
+      var desiredNotional = S.targetOrderNotional > 0 ? S.targetOrderNotional : Math.max(minNotional * 1.2, ctx.price * (ctx.minQty || 0));
+      var perSideBudget = Math.max(desiredNotional, minNotional);
+      var levelBudget = freeMarginQuote * 0.8;
+      var maxLevels = levelBudget > 0 && perSideBudget > 0 ? Math.floor(levelBudget / perSideBudget) : 1;
+      var autoLevels = clamp(maxLevels, 2, 8);
+      if (!Number.isFinite(plan.levels) || plan.levels !== autoLevels) {
+        plan.levels = autoLevels;
+      }
+      if (!Number.isFinite(plan.maxActive) || plan.maxActive < plan.levels) {
+        plan.maxActive = plan.levels * 2 + (plan.trimLevels || 1);
+      }
+    }
+
+    if (S.autoAlloc) {
+      var alloc = freeMarginQuote > 0 ? clamp(0.35 + volatility * 1.2, 0.15, 0.85) : S.allocPct;
+      S.allocPct = alloc;
+      S.midReservePct = clamp(1 - alloc, 0.1, 0.6);
+    }
+
+    if (S.autoGridStep) {
+      var base = Math.max(tickPct * 3, volatility * 0.35);
+      if (plan.levels > 0) base = Math.max(base, (volatility * 0.6) / (plan.levels + 1));
+      S.gridStepPct = clamp(base, tickPct * 1.5, 0.03);
+    }
+
+    if (S.autoSkew) {
+      var inventoryTilt = clamp(ctx.inventoryRatio || 0, -1, 1);
+      var skew = clamp(inventoryTilt * 1.2, -0.95, 0.95);
+      S.skewK = skew;
+    }
+
+    S.orderPlan = plan;
+    if (!Number.isFinite(S._autoLogTs) || Date.now() - S._autoLogTs > 20_000) {
+      console.log('[GRID]', S.role, 'auto-params', {
+        allocPct: S.allocPct,
+        reservePct: S.midReservePct,
+        gridStepPct: S.gridStepPct,
+        skewK: S.skewK,
+        levels: plan.levels,
+        volatility: volatility
+      });
+      S._autoLogTs = Date.now();
+    }
   }
   function markApiFailure(reason) {
     var nowTs = Date.now();
@@ -674,6 +815,25 @@
   S._minNotEff = minNotEff;
   S._exMinQty = minQtyEff;
   S._exMinNot = minNotEff;
+
+  var feeRates = extractFeeRates(gb.data);
+  var makerFee = clamp(feeRates.maker, 0, 0.01);
+  var takerFee = clamp(feeRates.taker, 0, 0.02);
+  S._makerFee = makerFee;
+  S._takerFee = takerFee;
+
+  var volatility = extractVolatility(gb.data);
+  S._volatility = volatility;
+
+  applyAutoParameters({
+    price: price,
+    tick: marketTick,
+    freeMargin: freeMargin(),
+    minNotional: minNotEff,
+    minQty: minQtyEff,
+    inventoryRatio: invRatio,
+    volatility: volatility
+  });
 
   // ====== Auto-shed om över cap ======
   async function maybeAutoShed() {
@@ -927,6 +1087,7 @@
 
     // Trim-avstånd
     var trimGapAbs = Math.max(S.priceStep || 0, stepAbs * (orderPlan.trimDistanceFactor || 1));
+    var feeBufferAbs = Math.max(0, (price > 0 ? price : 1) * (takerFee + makerFee) * S.feeBufferMultiplier);
 
     if (S.role === 'long') {
       for (var bi=0; bi<bids.length; bi++) pushDesired('buy',  bids[bi], sizeBaseB[bi], 'bid-' + bi);
@@ -935,7 +1096,7 @@
         var base0 = preciseRoundToStep(sizeBaseA[ti] * (S.trimInsidePct || 0.25), qtyStep);
         var amtTrim = preciseCeilToStep(Math.max(dynamicMinBaseMid, base0), qtyStep);
         if (S.reduceOnlyTrims) amtTrim = Math.min(amtTrim, Math.max(0, Math.abs(qty)));
-        var pxT = fixPrice(price + (ti + 1) * trimGapAbs);
+        var pxT = fixPrice(price + (ti + 1) * trimGapAbs + feeBufferAbs);
         if (pxT > 0 && amtTrim > 0) pushDesired('sell', pxT, amtTrim, 'trimAsk-' + ti + '|RO');
       }
     } else {
@@ -945,7 +1106,7 @@
         var base0s = preciseRoundToStep(sizeBaseB[tj] * (S.trimInsidePct || 0.25), qtyStep);
         var amtTrimS = preciseCeilToStep(Math.max(dynamicMinBaseMid, base0s), qtyStep);
         if (S.reduceOnlyTrims) amtTrimS = Math.min(amtTrimS, Math.max(0, Math.abs(qty)));
-        var pxTs = fixPrice(price - (tj + 1) * trimGapAbs);
+        var pxTs = fixPrice(price - (tj + 1) * trimGapAbs - feeBufferAbs);
         if (pxTs > 0 && amtTrimS > 0) pushDesired('buy', pxTs, amtTrimS, 'trimBid-' + tj + '|RO');
       }
     }
@@ -959,7 +1120,8 @@
       'gridBudget=' + allocQuote.toFixed(4),
       'reserved=' + reserveQuote.toFixed(4),
       'bidBudget=' + bidAllocQuote.toFixed(4),
-      'askBudget=' + askAllocQuote.toFixed(4)
+      'askBudget=' + askAllocQuote.toFixed(4),
+      'feeBuffer=' + feeBufferAbs.toFixed(6)
     );
 
     if (desiredOrders.length === 0) {
@@ -1006,121 +1168,6 @@
         if (dist < bestDist) { bestDist = dist; best = d; }
       }
       return best;
-    }
-
-    function stringIndicatesFailure(str) {
-      if (typeof str !== 'string') return false;
-      var lowered = str.trim().toLowerCase();
-      if (!lowered.length) return false;
-      var successHints = ['ok', 'success', 'succeeded', 'filled', 'created', 'done', 'placed', 'ack', 'acknowledged', 'accepted', 'submitted', 'complete', 'completed', 'new'];
-      for (var i = 0; i < successHints.length; i++) {
-        if (lowered === successHints[i]) return false;
-      }
-      var failureHints = [
-        'error', 'fail', 'failed', 'denied', 'insufficient', 'insuff', 'reject', 'rejected', 'exceed', 'exceeded',
-        'not enough', 'not_enough', 'not allow', 'not_allowed', 'not permitted', 'forbid', 'forbidden',
-        'invalid', 'cancelled', 'canceled', 'timeout', 'timed out', 'too many', 'exhausted', 'limit reached',
-        'unable', 'missing', 'not support', 'not supported', 'not available', 'maintenance', 'system busy', 'risk limit'
-      ];
-      for (var j = 0; j < failureHints.length; j++) {
-        if (lowered.indexOf(failureHints[j]) >= 0) return true;
-      }
-      return false;
-    }
-
-    function interpretCodeField(field, value) {
-      if (typeof value === 'undefined' || value === null) return 'unknown';
-      if (typeof value === 'boolean') return value ? 'success' : 'failure';
-      if (typeof value === 'number') {
-        if (field === 'code' && value >= 200 && value < 300) return 'success';
-        return value === 0 ? 'success' : 'failure';
-      }
-      if (typeof value === 'string') {
-        var trimmed = value.trim();
-        if (!trimmed.length) return 'unknown';
-        var lowered = trimmed.toLowerCase();
-        if (lowered === '0' || lowered === 'ok' || lowered === 'success') return 'success';
-        if (field === 'code') {
-          var num = Number(trimmed);
-          if (Number.isFinite(num)) {
-            if (num >= 200 && num < 300) return 'success';
-            return num === 0 ? 'success' : 'failure';
-          }
-        } else {
-          var num2 = Number(trimmed);
-          if (Number.isFinite(num2)) return num2 === 0 ? 'success' : 'failure';
-        }
-        if (lowered === 'false') return 'failure';
-        if (stringIndicatesFailure(lowered)) return 'failure';
-        return 'unknown';
-      }
-      return 'unknown';
-    }
-
-    function analyzePlacementFailure(value) {
-      var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
-      var maxDepth = 6;
-      function inspect(current, depth) {
-        if (depth > maxDepth) return { failed: false };
-        if (current === null || typeof current === 'undefined') return { failed: false };
-        if (current === false) return { failed: true, reason: 'boolean-false' };
-        if (typeof current === 'string') {
-          if (stringIndicatesFailure(current)) {
-            var txt = current.trim();
-            return { failed: true, reason: 'string:' + (txt.length > 64 ? txt.slice(0, 61) + '…' : txt) };
-          }
-          return { failed: false };
-        }
-        if (typeof current === 'number') return { failed: false };
-        if (Array.isArray(current)) {
-          for (var i = 0; i < current.length; i++) {
-            var res = inspect(current[i], depth + 1);
-            if (res.failed) return res;
-          }
-          return { failed: false };
-        }
-        if (typeof current === 'object') {
-          if (seen) {
-            if (seen.has(current)) return { failed: false };
-            seen.add(current);
-          }
-          var codeFields = ['retCode', 'ret_code', 'code', 'errorCode', 'error_code', 'err_code', 'errno', 'statusCode', 'status_code', 'retcode'];
-          for (var j = 0; j < codeFields.length; j++) {
-            var key = codeFields[j];
-            if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
-            var verdict = interpretCodeField(key, current[key]);
-            if (verdict === 'failure') return { failed: true, reason: key + '=' + String(current[key]) };
-          }
-          var boolFields = ['success', 'succeeded', 'isSuccess', 'is_success', 'ok', 'result', 'retSuccess', 'ret_success'];
-          for (var k = 0; k < boolFields.length; k++) {
-            var bKey = boolFields[k];
-            if (!Object.prototype.hasOwnProperty.call(current, bKey)) continue;
-            var bVal = current[bKey];
-            if (typeof bVal === 'boolean') {
-              if (!bVal) return { failed: true, reason: bKey + '=false' };
-            } else if (typeof bVal === 'string') {
-              var trimmed = bVal.trim();
-              if (!trimmed.length) continue;
-              var lowered = trimmed.toLowerCase();
-              if (lowered === 'false') return { failed: true, reason: bKey + '=false' };
-              if (stringIndicatesFailure(trimmed)) return { failed: true, reason: bKey + '=' + trimmed };
-            }
-          }
-          var keys = Object.keys(current);
-          for (var m = 0; m < keys.length; m++) {
-            var keyName = keys[m];
-            var child = current[keyName];
-            var childRes = inspect(child, depth + 1);
-            if (childRes.failed) {
-              if (!childRes.reason && typeof child === 'string') childRes.reason = keyName + '=' + child;
-              return childRes;
-            }
-          }
-          return { failed: false };
-        }
-        return { failed: false };
-      }
-      return inspect(value, 0);
     }
 
     function extractErrorMessage(value) {
@@ -1310,11 +1357,12 @@
         }
         if (!ok) {
           var errMsg = extractErrorMessage(res);
-          var extraInfo = [];
-          if (failureAnalysis.reason) extraInfo.push('reason=' + failureAnalysis.reason);
-          if (errMsg && errMsg !== failureAnalysis.reason) extraInfo.push('err=' + errMsg);
-          var extraTxt = extraInfo.length ? extraInfo.join(' ') : '';
-          console.log('[GRID] place returned error-ish response', side, pxOk, { amtOk: amtOk, minQtyEff: minQtyEff, minNotEff: minNotEff }, extraTxt, '\nresp=', res);
+          console.log('[GRID] place svarade ej OK', side, pxOk, {
+            amtOk: amtOk,
+            minQtyEff: minQtyEff,
+            minNotEff: minNotEff,
+            response: res
+          }, errMsg ? 'err=' + errMsg : '');
           if (errMsg && shouldBackoff({ message: errMsg })) markApiFailure({ message: errMsg });
           return false;
         }
