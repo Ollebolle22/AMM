@@ -246,18 +246,14 @@
     var fn = gb.method[name];
     var args = Array.isArray(baseArgs) ? baseArgs.slice() : [];
 
-    var expected = Number.isFinite(fn.length) ? fn.length : 0;
-    if (expected > 0 && expected - 1 > args.length) {
-      while (args.length < expected - 1) args.push(null);
-    }
-
     var opts = buildOrderOptions(options);
-    args.push(opts);
+    var callArgs = args.concat(opts);
 
-    var expectsCallback = expected > 0 && expected > args.length;
+    var expected = Number.isFinite(fn.length) ? fn.length : 0;
+    var expectsCallback = expected > 0 && expected > callArgs.length;
 
     if (!expectsCallback) {
-      return fn.apply(gb.method, args);
+      return fn.apply(gb.method, callArgs);
     }
 
     return new Promise(function (resolve, reject) {
@@ -268,8 +264,8 @@
         if (err) reject(err); else resolve(result);
       }
 
-      var callArgs = args.slice();
-      callArgs.push(function () {
+      var asyncArgs = callArgs.slice();
+      asyncArgs.push(function () {
         var err = arguments[0];
         if (err) { finish(err); return; }
         if (arguments.length <= 1) { finish(null, { success: true }); return; }
@@ -279,7 +275,7 @@
       });
 
       try {
-        var ret = fn.apply(gb.method, callArgs);
+        var ret = fn.apply(gb.method, asyncArgs);
         if (ret && typeof ret.then === 'function') {
           ret.then(function (val) { finish(null, val); }, function (err) { finish(err); });
         } else if (typeof ret !== 'undefined') {
