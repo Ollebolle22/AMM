@@ -633,7 +633,8 @@
 
     if (S.autoSkew) {
       var inventoryTilt = clamp(ctx.inventoryRatio || 0, -1, 1);
-      var skew = clamp(inventoryTilt * 1.2, -0.95, 0.95);
+      var skew = clamp(Math.abs(inventoryTilt) * 1.2, 0, 0.95);
+      // Keep skewK non-negative so the inventory sign is carried solely by invRatio downstream
       S.skewK = skew;
     }
 
